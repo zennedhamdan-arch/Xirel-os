@@ -71,6 +71,7 @@ const PLANNING_INSTRUCTIONS = `You are the Xirel planning module. Given a user's
 Rules:
 - At most ${PLAN_MAX_STEPS} steps. Prefer fewer.
 - Each step is one verb phrase describing an action (resolve information, inspect something, use a tool, produce the answer).
+- For iterative test repair, use a step with toolHint null so it can read, edit, and rerun a preset after inspecting failures. Publication must be a separate durable job from local edits.
 - Do NOT include "verify" or "report the result" steps — the runtime adds those itself.
 - If the request is simple conversation, one step like "Answer the user's question directly, using tools only if needed." is correct.
 
@@ -109,6 +110,7 @@ Available tool names: ${params.toolNames?.join(', ') ?? ''}.
       ],
       model: getDefaultModel(providerPriority[0] ?? 'openrouter'),
       providerPriority,
+      modelByProvider: process.env.OPENROUTER_PLANNER_MODEL ? { openrouter: process.env.OPENROUTER_PLANNER_MODEL } : undefined,
       temperature: 0.1,
       maxOutputTokens: 500,
     });

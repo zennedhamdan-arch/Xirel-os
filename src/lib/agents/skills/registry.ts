@@ -17,7 +17,6 @@ import { projectStatusReportSkill } from './project-status-report';
 import { clipsForgeVideoProductionSkill } from './clips-forge-video-production';
 
 /** Type-erased view of a skill for the registry list. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnySkill = Skill<any, any>;
 
 const SKILLS: AnySkill[] = [projectStatusReportSkill, clipsForgeVideoProductionSkill];

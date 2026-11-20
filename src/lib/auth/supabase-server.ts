@@ -11,8 +11,8 @@ import { cookies } from 'next/headers';
  * operations that must bypass RLS (e.g. provisioning a workspace
  * during signup), use src/lib/db/admin.ts explicitly and sparingly.
  */
-export function createSupabaseServerClient() {
-  const cookieStore = cookies();
+export async function createSupabaseServerClient() {
+  const cookieStore = await cookies();
 
   return createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,

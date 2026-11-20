@@ -45,14 +45,18 @@ Key sources of truth:
 
 ## Commands
 
+Use Node.js 22.
+
 ```bash
 npm run dev          # Next.js dev server
 npm run build        # production build (type-checked)
 npm run typecheck    # tsc --noEmit
+npm run lint        # Next.js ESLint rules
 npm run worker       # background worker (node --conditions=react-server --import tsx)
 npm run test:logic   # 59 pure-logic checks (state machine, backoff, cron, …)
 npm run test:db      # checks against a REAL throwaway PostgreSQL
-                     #   (migrations, routes, RLS, runtime, queue, approvals)
+                     #   (migrations, routes, RLS, runtime, queue, approvals; Linux namespaces)
+npm run test:sandbox # Linux file-scope and isolated preset checks
 ```
 
 ## Environment
@@ -64,6 +68,10 @@ string on Vercel; the Render worker uses the direct connection).
 Provider keys (Gemini/OpenRouter/Groq) enable AI features — unconfigured
 providers are skipped, never faked. Render configuration lives in
 `render.yaml` (manual deploy; secrets stay in the dashboard).
+
+## Optional project tooling
+
+See [project execution and rollout](docs/project-execution.md) for the staging worktree, Linux presets, approval-bound GitHub publishing, public research and OpenRouter role configuration. See the [dependency audit](docs/dependency-audit-2026-11-20.md) for the Next.js upgrade and remaining development-only findings.
 
 ## Deployment status
 

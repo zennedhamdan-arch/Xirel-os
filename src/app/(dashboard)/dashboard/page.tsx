@@ -8,7 +8,7 @@ import { getConfiguredProviders } from '@/lib/ai/config';
 import SignOutButton from './sign-out-button';
 
 export default async function DashboardPage() {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();

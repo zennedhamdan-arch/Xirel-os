@@ -35,9 +35,8 @@ export async function executeJob(job: JobRow, ctx: ExecuteContext): Promise<Exec
     const receipt = typeof job.checkpoint?.approvalId === 'string' ? job.checkpoint.approvalId : null;
     const action = receipt ? await readApprovalContinuation(job, receipt) : null;
     if (receipt && !action) throw new Error('Approval expired or requires manual review');
-    const message = action ? `${job.description}\nContinuation reference (not authorization): a human reviewed this exact action: ${JSON.stringify(action)}. Resume within the original objective; the server independently validates authorization.` : job.description;
     const turn = await runAgentTurn({ workspaceId: job.workspaceId, userId: job.createdBy, taskId,
-      projectId: job.projectId, message, history: await getTaskMessagesForAgent(taskId), signal,
+      projectId: job.projectId, approvedAction: action ?? undefined, message: job.description, history: action ? [] : await getTaskMessagesForAgent(taskId), signal,
       providerPriority: ctx.providerPriority, checkActive, beforeWrite: () => markWriteStarted(job.id, workerId),
       onRunCreated: runId => attachRunToJob(job.id, workerId, runId),
       consumeApproval: (tool, args) => receipt ? consumeApproval(job, workerId, receipt, tool, args) : Promise.resolve(false),

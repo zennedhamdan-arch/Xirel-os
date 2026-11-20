@@ -15,9 +15,7 @@ import type { ToolRiskLevel } from './tools/types';
  *   high / destructive→ ALWAYS waiting_for_approval — never executed by an
  *                       unattended run
  *
- * No registered tool is currently moderate+; this policy is what makes it
- * SAFE to add such tools later — the runtime enforces the gate centrally
- * instead of trusting each tool to behave.
+ * The runtime enforces this policy centrally, including for GitHub publication.
  */
 
 export type ApprovalDecision =

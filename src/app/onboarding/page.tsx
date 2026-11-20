@@ -6,7 +6,7 @@ import { eq } from 'drizzle-orm';
 import CreateWorkspaceForm from './create-workspace-form';
 
 export default async function OnboardingPage() {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();

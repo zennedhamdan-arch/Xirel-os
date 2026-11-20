@@ -39,6 +39,8 @@ export interface ToolExecutionContext {
   workspaceId: string;
   userId: string;
   taskId: string;
+  projectId?: string | null;
+  signal?: AbortSignal;
 }
 
 export interface ToolResult<TOutput = unknown> {

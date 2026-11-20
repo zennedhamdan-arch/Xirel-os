@@ -18,11 +18,12 @@ const actionSchema = z.object({
  */
 export async function POST(
   request: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
+  const { id } = await params;
   const session = await requireUser();
   if (!session.ok) return session.response;
-  if (!isUuid(params.id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (!isUuid(id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   let body: unknown;
   try {
     body = await request.json();
@@ -34,7 +35,7 @@ export async function POST(
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
   }
 
-  const job = await getJob(params.id);
+  const job = await getJob(id);
   if (!job) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
   const guard = await requireWorkspaceAccess(job.workspaceId, 'member');

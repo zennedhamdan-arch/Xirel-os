@@ -12,10 +12,21 @@ import {
 } from './projects';
 
 import { githubScope, webSearchKey } from '@/lib/connectors/read-only';
-import { githubReadTool, webSearchTool } from './external';
+import { githubReadTool, webSearchTool, githubPublishTool, githubInspectTool, webPageTool } from './external';
+
+import { projectFileTool, projectEditTool, projectCommandTool } from './worktree';
+import { projectScope } from '@/lib/execution/files';
+import { githubWriteScope } from '@/lib/connectors/github-changes';
+import { allowedResearchOrigins } from '@/lib/connectors/research';
 
 const TOOL_REGISTRY: Record<string, ToolDefinition<any, any>> = {
   [githubReadTool.name]: githubReadTool,
+  [githubInspectTool.name]: githubInspectTool,
+  [githubPublishTool.name]: githubPublishTool,
+  [projectFileTool.name]: projectFileTool,
+  [projectEditTool.name]: projectEditTool,
+  [projectCommandTool.name]: projectCommandTool,
+  [webPageTool.name]: webPageTool,
   [webSearchTool.name]: webSearchTool,
   [calculatorTool.name]: calculatorTool,
   [getCurrentDatetimeTool.name]: getCurrentDatetimeTool,
@@ -30,9 +41,13 @@ export function getTool(name: string): ToolDefinition<any, any> | undefined {
   return TOOL_REGISTRY[name];
 }
 
-export function getAllTools(workspaceId?: string): ToolDefinition<any, any>[] {
+export function getAllTools(workspaceId?: string, projectId?: string | null, durable = false): ToolDefinition<any, any>[] {
   return Object.values(TOOL_REGISTRY).filter(tool => {
-    if (tool === githubReadTool) return !!workspaceId && !!githubScope(workspaceId);
+    if (tool === githubPublishTool) return durable && !!githubWriteScope(workspaceId, projectId);
+    if (tool === projectFileTool || tool === projectEditTool) return durable && !!projectScope(workspaceId, projectId);
+    if (tool === projectCommandTool) return durable && !!projectScope(workspaceId, projectId) && process.env.AGENT_EXEC_ENABLE === 'namespaces';
+    if (tool === webPageTool) return allowedResearchOrigins(workspaceId).size > 0;
+    if (tool === githubReadTool || tool === githubInspectTool) return !!workspaceId && !!githubScope(workspaceId);
     if (tool === webSearchTool) return !!workspaceId && !!webSearchKey(workspaceId);
     return true;
   });

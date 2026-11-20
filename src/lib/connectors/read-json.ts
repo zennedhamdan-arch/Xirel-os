@@ -1,8 +1,8 @@
 import 'server-only';
 
 /** Fixed-host connectors use a bounded body and never follow redirects with credentials. */
-export async function readConnectorJson(url: URL, headers: HeadersInit, maxBytes = 256_000): Promise<unknown> {
-  const response = await fetch(url, { headers, redirect: 'error', cache: 'no-store', signal: AbortSignal.timeout(8_000) });
+export async function readConnectorJson(url: URL, headers: HeadersInit, maxBytes = 256_000, init: { method?: string; body?: string; signal?: AbortSignal } = {}): Promise<unknown> {
+  const response = await fetch(url, { ...init, headers, redirect: 'error', cache: 'no-store', signal: AbortSignal.any([AbortSignal.timeout(8_000), ...(init.signal ? [init.signal] : [])]) });
   if (!response.ok || !response.body) {
     await response.body?.cancel();
     throw new Error(`External provider returned HTTP ${response.status}`);

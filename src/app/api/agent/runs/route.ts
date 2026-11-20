@@ -20,7 +20,7 @@ export async function GET(request: Request) {
     if (!access.ok) return access.response;
     return NextResponse.json({ runs: (await listRunsForWorkspaces([access.ctx.workspaceId])).map(publicRun) });
   }
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();

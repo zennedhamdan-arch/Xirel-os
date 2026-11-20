@@ -7,20 +7,23 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "eslint src worker scripts --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate --config=drizzle.config.ts",
     "db:push": "drizzle-kit push --config=drizzle.config.ts",
     "worker": "node --conditions=react-server --env-file-if-exists=.env.local --import tsx worker/index.ts",
     "test:logic": "tsx scripts/test-pure-logic.ts",
-    "test:db": "tsx scripts/test-db.ts"
+    "test:db": "tsx scripts/test-db.ts",
+    "test:sandbox": "node --conditions=react-server --import tsx scripts/test-project-sandbox.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.6.1",
     "@supabase/supabase-js": "^2.45.0",
+    "cheerio": "^1.2.0",
     "drizzle-orm": "^0.45.4",
+    "ipaddr.js": "^2.5.0",
     "lucide-react": "^0.468.0",
-    "next": "^14.2.5",
+    "next": "15.5.29",
     "postgres": "^3.4.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -36,13 +39,13 @@
     "drizzle-kit": "^0.31.11",
     "embedded-postgres": "^18.6.0-beta.19",
     "eslint": "^8.57.0",
-    "eslint-config-next": "^14.2.5",
+    "eslint-config-next": "15.5.29",
     "postcss": "^8.5.33",
     "tailwindcss": "^3.4.9",
     "typescript": "^5.5.4"
   },
   "engines": {
-    "node": ">=18.18.0"
+    "node": ">=22"
   },
   "overrides": {
     "next": {

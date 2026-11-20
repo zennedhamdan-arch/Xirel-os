@@ -13,15 +13,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  */
 export async function GET(
   _request: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
+  const { id } = await params;
   const session = await requireUser();
   if (!session.ok) return session.response;
-  if (!UUID.test(params.id)) {
+  if (!UUID.test(id)) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
 
-  const job = await getJob(params.id);
+  const job = await getJob(id);
   if (!job) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }

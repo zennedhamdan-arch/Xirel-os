@@ -15,9 +15,10 @@ import { getRunDetail } from '@/lib/agents/runs';
  */
 export async function GET(
   _request: Request,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const supabase = createSupabaseServerClient();
+  const { id } = await params;
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -26,7 +27,7 @@ export async function GET(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const runId = params.id;
+  const runId = id;
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!UUID_RE.test(runId)) {
     return NextResponse.json({ error: 'Invalid run id' }, { status: 400 });
@@ -64,7 +65,7 @@ export async function GET(
         taskId: detail.run.taskId, startedAt: detail.run.startedAt, completedAt: detail.run.completedAt },
       steps: detail.steps.map(({ id, sequence, stepType, status, description, toolName, output }) => ({
         id, sequence, stepType, status, description: stepType === 'tool' ? `Tool: ${toolName ?? 'unknown'}` : description,
-        toolName, text: typeof output?.text === 'string' && ['plan', 'respond'].includes(stepType) ? output.text.slice(0, 36000) : null,
+        toolName, text: typeof output?.text === 'string' && ['plan', 'respond', 'tool'].includes(stepType) ? output.text.slice(0, 36000) : null,
       })),
       events: detail.events.map(({ id, eventType, createdAt }) => ({ id, eventType, createdAt })),
       toolAudit: detail.toolAudit.map(({ id, toolName, success, createdAt }) => ({ id, toolName, success, createdAt })),

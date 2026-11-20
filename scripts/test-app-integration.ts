@@ -1,6 +1,9 @@
 /** Real routes, Drizzle, SQL, scheduler, and worker; only session and AI transport are substituted. */
 import Module from 'node:module';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { NextRequest } from 'next/server';
 import type postgres from 'postgres';
@@ -14,6 +17,7 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
   let objectives: string[] = [];
   let plan = '{"steps":[{"description":"Answer from context"}]}';
   let toolCall: { name: string; arguments: Record<string, unknown> } | undefined;
+  let scriptedCalls: Record<string, Record<string, unknown>> = {};
   const queries: string[] = [];
   const db = drizzle(sql, { schema, logger: { logQuery: query => queries.push(query) } });
   const registry = { getConfiguredProviderInstances: () => [{ id: 'gemini' }] };
@@ -22,8 +26,10 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
       providerCalls++;
       const planning = req.messages[0]?.content.includes('planning module');
       if (!planning) objectives.push(req.messages.map(m => m.content).join('\n'));
-      const requested = !planning && toolCall && req.tools?.some(t => t.name === toolCall?.name) &&
-        req.messages.some(m => m.content.includes(`Required tool: ${toolCall?.name}`)) && !req.messages.some(m => m.role === 'tool') ? toolCall : null;
+      const tool = toolCall ?? Object.entries(scriptedCalls).map(([name, args]) => ({ name, arguments: args }))
+        .find(candidate => req.messages.some(m => m.content.includes(`Required tool: ${candidate.name}`)));
+      const requested = !planning && tool && req.tools?.some(t => t.name === tool.name) &&
+        req.messages.some(m => m.content.includes(`Required tool: ${tool.name}`)) && !req.messages.some(m => m.role === 'tool') ? tool : null;
       return { providerId: 'gemini', text: planning ? plan : 'Test-provider response', finishReason: requested ? 'tool_calls' : 'stop',
         toolCalls: requested ? [{ id: 'check', ...requested }] : [] };
     },
@@ -191,6 +197,126 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
         calls[1]!.startsWith('https://api.search.brave.com/') && calls.every(v => !v.includes('placeholder-only')) &&
         !!file && research[0]?.sourceUrl === 'https://example.org/reference');
     } finally { globalThis.fetch = originalFetch; }
+
+    const fixture = await mkdtemp(join(tmpdir(), 'xirel-worker-tool-test-'));
+    const gitSha = 'a'.repeat(40);
+    const treeSha = 'b'.repeat(40);
+    const commitSha = 'c'.repeat(40);
+    const settings: Record<string, string> = {
+      AGENT_EXEC_ROOT: fixture, AGENT_EXEC_WORKSPACE_ID: ids.a, AGENT_EXEC_PROJECT_ID: projectId,
+      AGENT_EXEC_ENABLE: 'namespaces', AGENT_EXEC_PRESETS: 'node-test',
+      AGENT_GITHUB_WORKSPACE_ID: ids.a, AGENT_GITHUB_REPOSITORY: 'sample/isolated', AGENT_GITHUB_REF: 'main',
+      AGENT_GITHUB_READ_TOKEN: 'mock-read', AGENT_GITHUB_WRITE_TOKEN: 'mock-write', AGENT_GITHUB_BASE_BRANCH: 'main',
+      AGENT_GITHUB_SHARED_FILES: 'test.js', OPENROUTER_API_KEY: 'mock-model',
+    };
+    const retrieval = require('../src/lib/ai/providers/openrouter-retrieval') as typeof import('../src/lib/ai/providers/openrouter-retrieval');
+    settings.OPENROUTER_EMBED_MODEL = retrieval.OPENROUTER_SELECTED_MODELS.embed;
+    settings.OPENROUTER_RERANK_MODEL = retrieval.OPENROUTER_SELECTED_MODELS.rerank;
+    const old = new Map(Object.keys(settings).map(k => [k, process.env[k]] as const));
+    Object.assign(process.env, settings);
+    const transport = globalThis.fetch;
+    try {
+      const commands = require('../src/lib/execution/files') as typeof import('../src/lib/execution/files');
+      const outbound: { url: string; method?: string; body?: Record<string, unknown> }[] = [];
+      let rejectDraft = false;
+      globalThis.fetch = (async (url: URL, init?: RequestInit) => {
+        const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+        outbound.push({ url: url.href, method: init?.method, body });
+        if (url.pathname.endsWith('/embeddings')) return Response.json({ data: [{ index: 1, embedding: [1, 2] }, { index: 0, embedding: [2, 3] }] });
+        if (url.pathname.endsWith('/rerank')) return Response.json({ results: [{ index: 1, relevance_score: 0.93 }, { index: 0, relevance_score: 0.2 }] });
+        if (url.hostname !== 'api.github.com') throw new Error('Unexpected destination');
+        if (url.pathname.endsWith('/git/ref/heads/main')) return Response.json({ ref: 'refs/heads/main', object: { sha: gitSha } });
+        if (url.pathname.endsWith(`/git/commits/${gitSha}`)) return Response.json({ sha: gitSha, tree: { sha: treeSha } });
+        if (url.pathname.endsWith('/git/commits')) return Response.json({ sha: commitSha });
+        if (url.pathname.endsWith('/git/trees')) return Response.json({ sha: treeSha });
+        if (url.pathname.endsWith('/git/refs')) return Response.json({ ref: body.ref, object: { sha: commitSha } });
+        if (url.pathname.endsWith('/pulls')) return rejectDraft ? new Response(null, { status: 503 }) :
+          Response.json({ html_url: 'https://github.com/sample/isolated/pull/12', number: 12 });
+        if (url.pathname.endsWith('/check-runs')) return Response.json({ check_runs: [{ name: 'test', status: 'completed', conclusion: 'success', html_url: null }] });
+        if (url.pathname.endsWith(`/commits/${commitSha}`)) return Response.json({ html_url: `https://github.com/sample/isolated/commit/${commitSha}`,
+          files: [{ filename: 'test.js', status: 'modified', additions: 1, deletions: 0, patch: '+fixture' },
+            { filename: 'unshared.js', status: 'modified', additions: 1, deletions: 0, patch: '+not shared' }] });
+        throw new Error('Unexpected GitHub action');
+      }) as typeof fetch;
+      const embedded = await retrieval.embedOpenRouter(['a', 'b']);
+      const reranked = await retrieval.rerankOpenRouter('query', ['a', 'b']);
+      check('OpenRouter embeddings and reranking use separate endpoints and validate response indices',
+        embedded.vectors[0]?.[0] === 2 && reranked.rankings[0]?.index === 1 &&
+        outbound[0]?.body?.model === settings.OPENROUTER_EMBED_MODEL && outbound[1]?.body?.model === settings.OPENROUTER_RERANK_MODEL);
+      const beforeWrongChat = outbound.length;
+      let wrongChatDenied = false;
+      try { retrieval.assertOpenRouterChatModel(retrieval.OPENROUTER_SELECTED_MODELS.embed); } catch { wrongChatDenied = true; }
+      check('embedding model cannot be used for OpenRouter chat', wrongChatDenied && outbound.length === beforeWrongChat);
+      const research = require('../src/lib/connectors/research') as typeof import('../src/lib/connectors/research');
+      check('web page policy rejects internal IPs and extracts readable HTML without scripts',
+        ['127.0.0.1', '10.10.0.1', '169.254.169.254', '100.64.0.1', '168.63.129.16', '::ffff:127.0.0.1'].every(ip => !research.isPublicAddress(ip)) &&
+        research.isPublicAddress('8.8.8.8') && research.extractResearchPage('<title>T</title><article><p>Evidence</p><script>Injected</script></article>', 'text/html').text === 'Evidence');
+      let rejected = false;
+      try { research.validateResearchUrl('https://allowed.example@localhost/secret', new Set(['https://allowed.example'])); } catch { rejected = true; }
+      check('research policy validates the target origin, not the URL prefix', rejected);
+
+      const fileText = 'const test = require("node:test"); test("safe fixture", () => {});';
+      scriptedCalls = { project_edit: { kind: 'create', path: 'test.js', text: fileText }, project_command: { preset: 'node-test' } };
+      plan = '{"steps":[{"description":"Write fixture","toolHint":"project_edit"},{"description":"Run isolated tests","toolHint":"project_command"}]}';
+      const fixtureJob = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'worktree', description: 'Author and run test', projectId });
+      const [fixtureClaim] = await queue.claimDueJobs({ workerId: 'worktree-worker' });
+      if (!fixtureClaim || fixtureClaim.id !== fixtureJob.job.id) throw new Error('Worktree job was not claimable');
+      const execute = (job: typeof fixtureClaim, workerId: string) => executeJob(job, { workerId, providerPriority: ['gemini'], signal: new AbortController().signal });
+      const workResult = await execute(fixtureClaim, 'worktree-worker');
+      check('actual durable worker edits the configured worktree and runs real isolated Node tests', workResult.outcome === 'completed');
+      const [audit] = await sql`select count(*)::int as count from tool_executions where run_id=${workResult.runId!} and tool_name='project_command' and success`;
+      check('isolated project command is recorded against its run', audit?.count === 1);
+      const written = await commands.readProjectFile(fixture, 'test.js');
+      plan = '{"steps":[{"description":"Publish the reviewed fixture","toolHint":"github_publish_change"}]}';
+      scriptedCalls = { github_publish_change: { repository: 'sample/isolated', baseBranch: 'main', baseSha: gitSha,
+        headBranch: 'xirel/fixture', title: 'Prepare fixture', files: [{ path: 'test.js', sha256: written.sha256 }], openPullRequest: true } };
+      const publication = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Publish fixture', description: 'Publish reviewed fixture', projectId });
+      const [publishClaim] = await queue.claimDueJobs({ workerId: 'publish-worker' });
+      if (!publishClaim || publishClaim.id !== publication.job.id) throw new Error('Publication was not claimable');
+      const beforeApproval = outbound.length;
+      const parked = await execute(publishClaim, 'publish-worker');
+      check('worker parks actual GitHub tool with zero outbound calls before approval', parked.outcome === 'waiting_approval' && outbound.length === beforeApproval);
+      const [pending] = await sql`select id from agent_approvals where job_id=${publication.job.id} and status='pending'`;
+      if (!pending) throw new Error('Publication did not create an exact receipt');
+      const { POST: approveRoute } = require('../src/app/api/agent/approvals/[id]/decide/route') as typeof import('../src/app/api/agent/approvals/[id]/decide/route');
+      const approval = await approveRoute(request({ decision: 'approved' }), { params: Promise.resolve({ id: pending.id }) });
+      check('owner can approve the exact GitHub publication job via the protected route', approval.ok);
+      const [publishResume] = await queue.claimDueJobs({ workerId: 'publish-resume' });
+      if (!publishResume) throw new Error('Approved publication did not requeue');
+      const beforeModel = providerCalls;
+      const published = await execute(publishResume, 'publish-resume');
+      const writes = outbound.slice(beforeApproval).filter(x => x.method === 'POST');
+      check('resumed worker publishes exact branch, commit and draft PR without asking the model to reconstruct approval',
+        published.outcome === 'completed' && providerCalls === beforeModel && writes.length === 4 &&
+        writes[2]?.body?.ref === 'refs/heads/xirel/fixture' && writes[3]?.body?.draft === true);
+      const connector = require('../src/lib/connectors/github-changes') as typeof import('../src/lib/connectors/github-changes');
+      const [changes, checks] = await Promise.all([connector.inspectGitHubCommit(ids.a, 'changes', commitSha), connector.inspectGitHubCommit(ids.a, 'checks', commitSha)]);
+      check('GitHub inspection returns shared diff excerpts and check runs without disclosing unshared patch text',
+        JSON.stringify(changes).includes('+fixture') && !JSON.stringify(changes).includes('+not shared') && JSON.stringify(checks).includes('success'));
+
+      scriptedCalls.github_publish_change = { ...scriptedCalls.github_publish_change, headBranch: 'xirel/partial' };
+      const partial = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Partial publication', description: 'Publish the second reviewed fixture', projectId });
+      const [partialClaim] = await queue.claimDueJobs({ workerId: 'partial-worker' });
+      if (!partialClaim || partialClaim.id !== partial.job.id) throw new Error('Partial publication was not claimable');
+      const partialPark = await execute(partialClaim, 'partial-worker');
+      const [partialReceipt] = await sql`select id from agent_approvals where job_id=${partial.job.id} and status='pending'`;
+      if (!partialReceipt || partialPark.outcome !== 'waiting_approval') throw new Error('Expected exact receipt for partial publication');
+      await approveRoute(request({ decision: 'approved' }), { params: Promise.resolve({ id: partialReceipt.id }) });
+      const [partialResume] = await queue.claimDueJobs({ workerId: 'partial-resume' });
+      if (!partialResume) throw new Error('Partial publication did not requeue');
+      rejectDraft = true;
+      const partialDone = await execute(partialResume, 'partial-resume');
+      const partialJob = await queue.getJob(partial.job.id);
+      const [partialReport] = await sql`select output from agent_steps where run_id=${partialJob?.runId ?? null} and step_type='tool' and status='failed'`;
+      check('failed draft creation reports the confirmed branch and does not retry external writes',
+        partialDone.outcome === 'failed' && partialJob?.status === 'failed' && partialReport?.output?.text?.includes('Branch created') &&
+        partialReport?.output?.text?.includes('xirel/partial') && (await queue.claimDueJobs({ workerId: 'no-repeat' })).length === 0);
+
+    } finally {
+      globalThis.fetch = transport;
+      for (const [key, value] of old) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      await rm(fixture, { recursive: true, force: true });
+    }
 
   } finally { loader._load = original; }
 }

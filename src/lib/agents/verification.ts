@@ -28,6 +28,7 @@ export interface VerificationInput {
     workspaceId: string;
     userId: string;
     taskId: string | null;
+    projectId?: string | null;
   };
 }
 
@@ -82,8 +83,26 @@ async function verifyCreateProject(input: VerificationInput): Promise<Verificati
   };
 }
 
+async function verifyFileEdit(input: VerificationInput): Promise<VerificationOutcome> {
+  const out = z.object({ path: z.string(), sha256: z.string() }).safeParse(input.toolOutput);
+  const { projectScope, readProjectFile } = await import('@/lib/execution/files');
+  const root = projectScope(input.context.workspaceId, input.context.projectId);
+  if (!input.toolSuccess || !out.success || !root) return { status: 'failed', method: 'file_hash', detail: 'No confirmed file edit' };
+  const current = await readProjectFile(root, out.data.path);
+  return current.sha256 === out.data.sha256 ? { status: 'verified', method: 'file_hash' } :
+    { status: 'failed', method: 'file_hash', detail: 'Written file hash did not match' };
+}
+
+async function verifyCommand(input: VerificationInput): Promise<VerificationOutcome> {
+  return input.toolSuccess && input.toolOutput?.code === 0 && input.toolOutput?.status === 'passed'
+    ? { status: 'verified', method: 'isolated_exit_status' }
+    : { status: 'failed', method: 'isolated_exit_status', detail: 'Isolated preset did not exit successfully' };
+}
+
 const VERIFIERS: Record<string, Verifier> = {
   create_project: verifyCreateProject,
+  project_edit: verifyFileEdit,
+  project_command: verifyCommand,
 };
 
 // ─────────────────────────────────────────────────────────

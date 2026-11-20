@@ -25,11 +25,12 @@ const actionsSchema = z.object({
  */
 export async function POST(
   request: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
+  const { id } = await params;
   const session = await requireUser();
   if (!session.ok) return session.response;
-  if (!isUuid(params.id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (!isUuid(id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   let body: unknown;
   try {
     body = await request.json();
@@ -41,7 +42,7 @@ export async function POST(
     return NextResponse.json({ error: 'Invalid action or payload' }, { status: 400 });
   }
 
-  const rows = await db.select().from(agentSchedules).where(eq(agentSchedules.id, params.id)).limit(1);
+  const rows = await db.select().from(agentSchedules).where(eq(agentSchedules.id, id)).limit(1);
   const schedule = rows[0];
   if (!schedule) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 

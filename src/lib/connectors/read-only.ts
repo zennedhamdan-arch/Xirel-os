@@ -3,15 +3,15 @@ import { z } from 'zod';
 import { readConnectorJson } from './read-json';
 
 const repoPattern = /^[\w.-]+\/[\w.-]+$/;
-const safeComponent = /^[\w .@-]+$/;
-const safePath = (path: string) => path.split('/').every(part => part !== '.' && part !== '..' && !part.startsWith('.') && safeComponent.test(part))
+const safeComponent = /^[\w .@()[\]-]+$/;
+export const safeGitHubPath = (path: string) => path.split('/').every(part => part !== '.' && part !== '..' && !part.startsWith('.') && safeComponent.test(part))
   && !/(?:^|[/_.-])(?:env|secrets?|credentials?|tokens?|id_rsa|passwd|private)(?:$|[/_.-])|\.(?:pem|key|p12|pfx)$/i.test(path);
 
 export function githubScope(workspaceId: string) {
   const repo = process.env.AGENT_GITHUB_REPOSITORY;
   const token = process.env.AGENT_GITHUB_READ_TOKEN;
   const ref = process.env.AGENT_GITHUB_REF;
-  const files = (process.env.AGENT_GITHUB_SHARED_FILES ?? '').split(',').map(x => x.trim()).filter(x => x && safePath(x));
+  const files = (process.env.AGENT_GITHUB_SHARED_FILES ?? '').split(',').map(x => x.trim()).filter(x => x && safeGitHubPath(x));
   return process.env.AGENT_GITHUB_WORKSPACE_ID === workspaceId && repo && repoPattern.test(repo) &&
     repo.split('/').every(part => part !== '.' && part !== '..') && token && ref
     ? { repo, token, ref, files } : null;
@@ -24,7 +24,7 @@ const branchSchema = z.array(z.object({ name: z.string(), protected: z.boolean()
 const fileSchema = z.object({ type: z.literal('file'), encoding: z.literal('base64'), size: z.number().int().max(12_000),
   content: z.string(), sha: z.string(), html_url: z.string().url() });
 
-export async function readGitHub(scope: RepoScope, operation: 'repository' | 'branches' | 'commits' | 'file', path?: string) {
+export async function readGitHub(scope: RepoScope, operation: 'repository' | 'branches' | 'commits' | 'file', path?: string, signal?: AbortSignal) {
   const url = new URL(`https://api.github.com/repos/${scope.repo}`);
   if (operation === 'file') {
     if (!path || !scope.files.includes(path)) throw new Error('File has not been explicitly shared with the agent');
@@ -36,7 +36,7 @@ export async function readGitHub(scope: RepoScope, operation: 'repository' | 'br
     if (operation === 'commits') url.searchParams.set('sha', scope.ref);
   }
   const result = await readConnectorJson(url, { Authorization: `Bearer ${scope.token}`, Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28' });
+    'X-GitHub-Api-Version': '2022-11-28' }, 256_000, { signal });
   switch (operation) {
     case 'repository': return { ...repoSchema.parse(result), allowedRef: scope.ref, sharedFiles: scope.files };
     case 'branches': return branchSchema.parse(result);
@@ -58,11 +58,11 @@ export function webSearchKey(workspaceId: string) {
 const searchSchema = z.object({ web: z.object({ results: z.array(z.object({ title: z.string(), url: z.string().url(),
   description: z.string().optional() })) }).optional() });
 
-export async function searchWeb(key: string, query: string) {
+export async function searchWeb(key: string, query: string, signal?: AbortSignal) {
   const url = new URL('https://api.search.brave.com/res/v1/web/search');
   url.searchParams.set('q', query);
   url.searchParams.set('count', '5');
-  const data = searchSchema.parse(await readConnectorJson(url, { 'X-Subscription-Token': key, Accept: 'application/json' }));
+  const data = searchSchema.parse(await readConnectorJson(url, { 'X-Subscription-Token': key, Accept: 'application/json' }, 256_000, { signal }));
   return (data.web?.results ?? []).filter(r => /^https?:\/\//i.test(r.url)).slice(0, 5).map(r => ({
     title: r.title.slice(0, 250), sourceUrl: r.url, untrustedSnippet: r.description?.slice(0, 500) ?? '' }));
 }

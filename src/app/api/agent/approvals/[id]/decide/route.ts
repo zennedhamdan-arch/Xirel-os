@@ -22,9 +22,10 @@ const decideSchema = z.object({
  */
 export async function POST(
   request: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.id)) {
+  const { id } = await params;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
 
@@ -42,7 +43,7 @@ export async function POST(
   const session = await requireUser();
   if (!session.ok) return session.response;
 
-  const rows = await db.select().from(agentApprovals).where(eq(agentApprovals.id, params.id)).limit(1);
+  const rows = await db.select().from(agentApprovals).where(eq(agentApprovals.id, id)).limit(1);
   const approval = rows[0];
   if (!approval) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 

@@ -1,4 +1,5 @@
 import 'server-only';
+import { assertOpenRouterChatModel } from './openrouter-retrieval';
 import type {
   AiChunk,
   AiProvider,
@@ -53,6 +54,7 @@ export const openrouterProvider: AiProvider = {
   },
 
   async generateText(request: AiRequest): Promise<AiResponse> {
+    assertOpenRouterChatModel(request.model);
     const start = Date.now();
     const apiKey = getApiKey();
 
@@ -67,6 +69,7 @@ export const openrouterProvider: AiProvider = {
       },
       body: JSON.stringify({
         model: request.model,
+        ...(request.tools?.length ? { provider: { require_parameters: true } } : {}),
         messages: toOpenAiMessages(request.messages),
         temperature: request.temperature ?? 0.7,
         max_tokens: request.maxOutputTokens,
@@ -107,11 +110,12 @@ export const openrouterProvider: AiProvider = {
   },
 
   async *streamText(request: AiRequest): AsyncIterable<AiChunk> {
+    assertOpenRouterChatModel(request.model);
     const apiKey = getApiKey();
 
     const res = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
       method: 'POST',
-      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+      signal: AbortSignal.any([AbortSignal.timeout(PROVIDER_TIMEOUT_MS), ...(request.signal ? [request.signal] : [])]),
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -171,11 +175,12 @@ export const openrouterProvider: AiProvider = {
   },
 
   async generateStructuredOutput<T>(request: StructuredAiRequest<T>): Promise<T> {
+    assertOpenRouterChatModel(request.model);
     const apiKey = getApiKey();
 
     const res = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
       method: 'POST',
-      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+      signal: AbortSignal.any([AbortSignal.timeout(PROVIDER_TIMEOUT_MS), ...(request.signal ? [request.signal] : [])]),
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -184,6 +189,7 @@ export const openrouterProvider: AiProvider = {
       },
       body: JSON.stringify({
         model: request.model,
+        provider: { require_parameters: true },
         messages: toOpenAiMessages(request.messages),
         temperature: request.temperature ?? 0,
         response_format: {

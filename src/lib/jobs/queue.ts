@@ -440,7 +440,9 @@ export async function readApprovalContinuation(job: JobRow, receiptId: string) {
     .where(and(eq(agentApprovals.id, receiptId), eq(agentApprovals.jobId, job.id), eq(agentApprovals.workspaceId, job.workspaceId),
       eq(agentApprovals.requestedBy, job.createdBy), eq(agentApprovals.status, 'approved'),
       sql`${agentApprovals.consumedAt} is null and ${agentApprovals.decidedAt} > now() - interval '1 hour'`));
-  return receipt?.payload.version === 1 ? { tool: receipt.tool, args: receipt.payload.args } : null;
+  const args = receipt?.payload.args;
+  return receipt?.payload.version === 1 && receipt.tool && args && typeof args === 'object' && !Array.isArray(args)
+    ? { tool: receipt.tool, args: args as Record<string, unknown> } : null;
 }
 
 /** Exact JSON arguments, pending job identity, fresh reviewer privileges and single use. */

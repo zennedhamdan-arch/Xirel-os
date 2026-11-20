@@ -87,7 +87,7 @@ export type UserGuardResult =
   | { ok: false; response: NextResponse };
 
 export async function requireUser(): Promise<UserGuardResult> {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();

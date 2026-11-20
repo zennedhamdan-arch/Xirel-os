@@ -52,6 +52,7 @@ export interface OrchestratorRunRequest {
    */
   hooks?: OrchestratorHooks;
   signal?: AbortSignal;
+  projectId?: string | null;
   allowedTool?: string;
   checkActive?: () => Promise<void>;
   beforeWrite?: () => Promise<void>;
@@ -114,7 +115,7 @@ async function logToolExecution(params: {
       runId: params.runId ?? null,
       toolName: params.toolName,
       riskLevel: params.riskLevel as never,
-      input: params.input,
+      input: { keys: Object.keys(params.input) },
       output: params.output ?? null,
       success: params.success,
       error: params.error,
@@ -133,6 +134,8 @@ async function executeToolCall(
     workspaceId: string;
     userId: string;
     taskId: string;
+    projectId?: string | null;
+    signal?: AbortSignal;
     runId?: string | null;
     beforeWrite?: () => Promise<void>;
     consumeApproval?: OrchestratorRunRequest['consumeApproval'];
@@ -148,7 +151,7 @@ async function executeToolCall(
       runId: ctx.runId ?? null,
       toolName: call.name,
       riskLevel: 'safe',
-      input: call.arguments,
+      input: { redacted: true },
       output: undefined,
       success: false,
       error,
@@ -163,7 +166,7 @@ async function executeToolCall(
       runId: ctx.runId ?? null,
       toolName: tool.name,
       riskLevel: tool.riskLevel,
-      input: call.arguments,
+      input: { redacted: true },
       output: undefined,
       success: false,
       error,
@@ -173,13 +176,13 @@ async function executeToolCall(
 
   const parsed = tool.inputSchema.safeParse(call.arguments);
   if (!parsed.success) {
-    const error = `Invalid arguments for tool "${tool.name}": ${parsed.error.message}`;
+    const error = `Invalid arguments for tool "${tool.name}".`;
     await logToolExecution({
       taskId: ctx.taskId,
       runId: ctx.runId ?? null,
       toolName: tool.name,
       riskLevel: tool.riskLevel,
-      input: call.arguments,
+      input: { redacted: true },
       output: undefined,
       success: false,
       error,
@@ -192,18 +195,34 @@ async function executeToolCall(
     return JSON.stringify({ success: false, approval_required: true, riskLevel: tool.riskLevel });
   }
   if (tool.riskLevel !== 'safe') await ctx.beforeWrite?.();
+  // A persisted start record is required before a child process can run.
+  let commandAuditId: string | undefined;
+  if (tool.name === 'project_command') {
+    const [record] = await db.insert(toolExecutions).values({ taskId: ctx.taskId, runId: ctx.runId ?? null,
+      toolName: tool.name, riskLevel: 'safe', input: { preset: parsed.data.preset }, success: false, output: { status: 'started' } }).returning({ id: toolExecutions.id });
+    if (!record) throw new Error('Command audit could not be recorded');
+    commandAuditId = record.id;
+  }
   try {
     const result = await tool.execute(parsed.data, ctx);
-    await logToolExecution({
-      taskId: ctx.taskId,
-      runId: ctx.runId ?? null,
-      toolName: tool.name,
-      riskLevel: tool.riskLevel,
-      input: call.arguments,
-      output: { recorded: true },
-      success: result.success,
-      error: result.error,
-    });
+    if (commandAuditId) {
+      const output = result.output as { status?: string; code?: number | null; stdout?: string; stderr?: string } | undefined;
+      await db.update(toolExecutions).set({ success: result.success, error: result.error,
+        output: { status: output?.status ?? 'failed', exitCode: output?.code ?? null,
+          stdoutBytes: Buffer.byteLength(output?.stdout ?? ''), stderrBytes: Buffer.byteLength(output?.stderr ?? '') } })
+        .where(eq(toolExecutions.id, commandAuditId));
+    } else {
+      await logToolExecution({
+        taskId: ctx.taskId,
+        runId: ctx.runId ?? null,
+        toolName: tool.name,
+        riskLevel: tool.riskLevel,
+        input: { redacted: true },
+        output: { recorded: true },
+        success: result.success,
+        error: result.error,
+      });
+    }
     return JSON.stringify(result);
   } catch (err) {
     // A tool's execute() throwing is a bug in the tool, not a reason to
@@ -211,18 +230,36 @@ async function executeToolCall(
     // so it can decide how to proceed (retry, try another approach, tell
     // the user), same as any other tool failure.
     const error = 'Tool execution failed';
+    if (commandAuditId) {
+      await db.update(toolExecutions).set({ success: false, error, output: { status: 'failed' } }).where(eq(toolExecutions.id, commandAuditId));
+      return JSON.stringify({ success: false, error });
+    }
     await logToolExecution({
       taskId: ctx.taskId,
       runId: ctx.runId ?? null,
       toolName: tool.name,
       riskLevel: tool.riskLevel,
-      input: call.arguments,
+      input: { redacted: true },
       output: undefined,
       success: false,
       error,
     });
     return JSON.stringify({ success: false, error });
   }
+}
+
+/** Resume only the exact server-stored receipt, never a replacement proposed by a model. */
+export async function runApprovedTool(request: OrchestratorRunRequest, runId: string, action: { tool: string; args: Record<string, unknown> }) {
+  request.signal?.throwIfAborted();
+  await request.checkActive?.();
+  const role = await getWorkspaceRole(request.workspaceId, request.userId);
+  const tool = getAllTools(request.workspaceId, request.projectId, true).find(t => t.name === action.tool);
+  if (!role || !tool || !hasPermission(role, tool.requiredPermission) || !request.consumeApproval || !request.beforeWrite ||
+    requiresApproval(tool.riskLevel).action !== 'requires_approval') throw new Error('Approved action is unavailable');
+  return JSON.parse(await executeToolCall({ id: 'approved-receipt', name: action.tool, arguments: action.args }, {
+    workspaceId: request.workspaceId, userId: request.userId, taskId: request.taskId, projectId: request.projectId,
+    signal: request.signal, runId, beforeWrite: request.beforeWrite, consumeApproval: request.consumeApproval,
+  }, role)) as { success: boolean; output?: Record<string, unknown>; error?: string };
 }
 
 export async function runOrchestrator(
@@ -244,7 +281,7 @@ export async function runOrchestrator(
     throw new Error('runOrchestrator: providerPriority was empty — no provider to route to.');
   }
 
-  const availableTools = getAllTools(request.workspaceId).filter((t) => hasPermission(userRole, t.requiredPermission) && (!request.allowedTool || request.allowedTool === t.name));
+  const availableTools = getAllTools(request.workspaceId, request.projectId, !!request.beforeWrite).filter((t) => hasPermission(userRole, t.requiredPermission) && (!request.allowedTool || request.allowedTool === t.name));
   const aiTools = toAiToolDefinitions(availableTools);
 
   const conversation: AiMessage[] = [...request.messages];
@@ -318,12 +355,12 @@ export async function runOrchestrator(
       if (!currentRole || currentRole === 'viewer') throw new Error('Workspace execution permission was revoked');
       const resultJson = availableTools.some(t => t.name === call.name)
         ? await executeToolCall(call, { workspaceId: request.workspaceId, userId: request.userId,
-          taskId: request.taskId, runId: hooks?.runId, beforeWrite: request.beforeWrite,
+          taskId: request.taskId, projectId: request.projectId, signal: request.signal, runId: hooks?.runId, beforeWrite: request.beforeWrite,
           consumeApproval: request.consumeApproval }, currentRole)
         : JSON.stringify({ success: false, error: 'Tool is not available for this step' });
       const result = JSON.parse(resultJson) as { success?: boolean; approval_required?: boolean };
       await hooks?.onToolExecuted?.(call, resultJson, result.success === true);
-      if (result.approval_required || !result.success) {
+      if (result.approval_required || (!result.success && call.name !== 'project_command' && call.name !== 'web_read_page')) {
         return { text: result.approval_required ? 'Waiting for approval.' : 'A tool failed.', newMessages,
           providerId: response.providerId, iterations: iteration + 1 };
       }

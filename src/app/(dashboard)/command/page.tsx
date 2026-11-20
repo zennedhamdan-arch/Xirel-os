@@ -16,9 +16,9 @@ import CommandClient from './command-client';
 export default async function CommandPage({
   searchParams,
 }: {
-  searchParams: { workspace?: string };
+  searchParams: Promise<{ workspace?: string }>;
 }) {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -29,7 +29,7 @@ export default async function CommandPage({
 
   const isSetupComplete = await isCommandSetupComplete();
 
-  const requested = searchParams.workspace;
+  const requested = (await searchParams).workspace;
   if (requested && !isUuid(requested)) redirect('/command');
   const membership = await db.query.workspaceMembers.findFirst({
     where: and(eq(workspaceMembers.userId, user.id), requested ? eq(workspaceMembers.workspaceId, requested) : undefined),

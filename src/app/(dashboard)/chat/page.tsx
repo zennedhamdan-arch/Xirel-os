@@ -9,9 +9,9 @@ import ChatClient from './chat-client';
 export default async function ChatPage({
   searchParams,
 }: {
-  searchParams: { workspace?: string };
+  searchParams: Promise<{ workspace?: string }>;
 }) {
-  const supabase = createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -24,7 +24,7 @@ export default async function ChatPage({
   const isSetupComplete = await isPhase2SetupComplete();
 
   // Get user's first workspace if none specified
-  let workspaceId = searchParams.workspace;
+  let workspaceId = (await searchParams).workspace;
 
   if (!workspaceId) {
     const membership = await db.query.workspaceMembers.findFirst({
@@ -68,7 +68,7 @@ export default async function ChatPage({
                     (project registry + agent runs — required for the agent
                     runtime)
                   </li>
-                  <li>4. Click "Run" to execute the migration</li>
+                  <li>4. Click &quot;Run&quot; to execute the migration</li>
                   <li>5. Refresh this page once complete</li>
                 </ol>
               </div>
