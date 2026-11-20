@@ -37,7 +37,7 @@ const outputSchema = z.object({
     z.object({
       status: z.enum(['submitted', 'processing', 'generated', 'retrieved', 'verified', 'approved', 'published']),
       assetUrl: z.string().nullable(),
-      platformRefs: z.record(z.string()),
+      platformRefs: z.record(z.string(), z.string()),
     }),
   ),
 });

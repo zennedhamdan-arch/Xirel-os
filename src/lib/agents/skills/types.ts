@@ -40,9 +40,9 @@ export interface Skill<I = unknown, O = unknown> {
   version: string;
   /** Zod schema for the skill's input (validated before execution).
    *  Input-side is `unknown` so schemas using defaults coerce properly. */
-  inputSchema: z.ZodType<I, z.ZodTypeDef, unknown>;
+  inputSchema: z.ZodType<I, unknown>;
   /** Zod schema for the skill's structured output. */
-  outputSchema: z.ZodType<O, z.ZodTypeDef, unknown>;
+  outputSchema: z.ZodType<O, unknown>;
   /** Tool names that must be registered for this skill to run. */
   requiredTools: string[];
   /** Highest risk level the skill's underlying operations imply. */

@@ -26,7 +26,7 @@ const outputSchema = z.object({
       status: z.string(),
       repoUrl: z.string().nullable(),
       deploymentUrl: z.string().nullable(),
-      memory: z.record(z.string()),
+      memory: z.record(z.string(), z.string()),
       recentTaskCount: z.number(),
     }),
   ),
