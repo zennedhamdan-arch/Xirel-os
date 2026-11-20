@@ -1,6 +1,7 @@
 import 'server-only';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
+import { databaseConnectionOptions } from './connection-options';
 import * as schema from './schema';
 
 if (!process.env.DATABASE_URL) {
@@ -28,8 +29,8 @@ if (!process.env.DATABASE_URL) {
 //   fail with "prepared statement ... does not exist". postgres-js
 //   transparently uses unnamed statements with this flag.
 //
-// - ssl: 'require' — Supabase Postgres requires TLS. Explicit here so
-//   correctness doesn't depend on sslmode params inside DATABASE_URL.
+// - TLS is required. Set DATABASE_SSL_VERIFY=true after validating the
+//   staging database hostname and CA chain to enforce peer verification.
 //
 // - connect_timeout: 10 / idle_timeout: 20 — fail fast when a new
 //   connection can't be established at all, and close connections that
@@ -44,12 +45,6 @@ if (!process.env.DATABASE_URL) {
 // hostnames or credentials, and never commit them. The direct
 // connection (port 5432) bypasses PgBouncer and will exhaust the
 // connection limit under serverless load.
-const client = postgres(process.env.DATABASE_URL, {
-  max: 1,
-  prepare: false,
-  connect_timeout: 10,
-  idle_timeout: 20,
-  ssl: 'require',
-});
+const client = postgres(process.env.DATABASE_URL, databaseConnectionOptions());
 
 export const db = drizzle(client, { schema });

@@ -1,4 +1,6 @@
 import { redirect } from 'next/navigation';
+import { getAppOrigin } from '@/lib/auth/app-origin';
+import { loginUrl } from '@/lib/auth/redirect';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
 import { workspaceMembers } from '@/lib/db/schema';
@@ -12,7 +14,7 @@ export default async function OnboardingPage() {
   } = await supabase.auth.getUser();
 
   if (!user) {
-    redirect('/login');
+    redirect(loginUrl(getAppOrigin(), '/onboarding').href);
   }
 
   // If they already have a workspace, onboarding is done — don't show

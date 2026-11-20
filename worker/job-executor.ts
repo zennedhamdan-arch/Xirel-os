@@ -4,7 +4,7 @@ import { getWorkspaceRole } from '@/lib/jobs/task-helpers';
 import { getProject } from '@/lib/projects/queries';
 import { attachJobTask, attachRunToJob, consumeApproval, finishJob, getJob, markWriteStarted, readApprovalContinuation,
   transitionJob, waitForApproval, type JobRow } from '@/lib/jobs/queue';
-import { classifyError } from '@/lib/jobs/errors';
+import { classifyError, ProviderRouteFailure } from '@/lib/jobs/errors';
 import type { AiProviderId } from '@/lib/ai/types';
 import { getTaskMessagesForAgent } from '@/lib/tasks/queries';
 
@@ -51,12 +51,12 @@ export async function executeJob(job: JobRow, ctx: ExecuteContext): Promise<Exec
       const state = await finishJob(job.id, workerId, { kind: 'completed', checkpoint: { runId: turn.runId } });
       return { outcome: state === 'completed' ? 'completed' : 'not_owner', runId: turn.runId };
     }
+    if (turn.providerFailure) throw new ProviderRouteFailure(turn.providerFailure);
     throw new Error(turn.error ?? 'Execution did not complete');
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
-    const safe = message === 'Manual review required after interrupted write' ? message :
-      message === 'Provider unavailable or timed out' ? 'Provider timeout' : 'Execution did not complete';
-    const state = await finishJob(job.id, workerId, { kind: 'failed_permanently', error: classifyError({ message: safe }) });
+    const safe = error instanceof ProviderRouteFailure || message === 'Manual review required after interrupted write' ? message : 'Execution did not complete';
+    const state = await finishJob(job.id, workerId, { kind: 'failed_permanently', error: error instanceof ProviderRouteFailure ? error.classification : classifyError({ message: safe }) });
     return { outcome: state === 'retrying' ? 'retry_scheduled' : state === 'failed' ? 'failed' : 'not_owner', detail: safe };
   }
 }

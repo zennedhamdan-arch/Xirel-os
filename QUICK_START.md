@@ -1,5 +1,7 @@
 # Quick Start — Phase 2 Deployment
 
+> Historical deployment notes. For current Render authentication configuration, see [Render authentication setup](docs/render-authentication.md).
+
 **Current Status:** ✅ Ready to Deploy  
 **Time Required:** 15-20 minutes  
 **Difficulty:** Easy
@@ -28,7 +30,7 @@ Wait for Vercel to build (check dashboard). Should show ✅ Success.
 
 ### Step 3: Test (5 minutes)
 
-1. Go to https://xirel-os-rwgv.vercel.app/chat
+1. Go to https://xirel-os.onrender.com/chat
 2. If you see "Setup Required" → run Step 2 again, then refresh
 3. Once chat page loads, send: "Hello, who are you?"
 4. Wait 1-3 seconds for response to start streaming

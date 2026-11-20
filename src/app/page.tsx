@@ -1,4 +1,6 @@
 import { redirect } from 'next/navigation';
+import { getAppOrigin } from '@/lib/auth/app-origin';
+import { loginUrl } from '@/lib/auth/redirect';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 
 export default async function RootPage() {
@@ -7,5 +9,5 @@ export default async function RootPage() {
     data: { user },
   } = await supabase.auth.getUser();
 
-  redirect(user ? '/command' : '/login');
+  redirect(user ? '/command' : loginUrl(getAppOrigin()).href);
 }

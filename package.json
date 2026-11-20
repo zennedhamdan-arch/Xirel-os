@@ -14,7 +14,11 @@
     "worker": "node --conditions=react-server --env-file-if-exists=.env.local --import tsx worker/index.ts",
     "test:logic": "tsx scripts/test-pure-logic.ts",
     "test:db": "tsx scripts/test-db.ts",
-    "test:sandbox": "node --conditions=react-server --import tsx scripts/test-project-sandbox.ts"
+    "test:sandbox": "node --conditions=react-server --import tsx scripts/test-project-sandbox.ts",
+    "test:providers": "node --conditions=react-server --import tsx scripts/staging-provider-probes.ts",
+    "staging:preflight": "node --import tsx scripts/staging-preflight.ts",
+    "test:staging-web": "node scripts/test-staging-web.mjs",
+    "test:auth": "tsx scripts/test-auth.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.6.1",
@@ -50,6 +54,9 @@
   "overrides": {
     "next": {
       "postcss": "8.5.33"
+    },
+    "tailwindcss": {
+      "postcss-selector-parser": "6.1.6"
     }
   }
 }

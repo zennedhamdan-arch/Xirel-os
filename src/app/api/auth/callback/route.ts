@@ -1,28 +1,28 @@
-import { getSafeAuthRedirect } from '@/lib/auth/redirect';
+import { getAppOrigin } from '@/lib/auth/app-origin';
+import { getSafeAuthRedirect, loginUrl } from '@/lib/auth/redirect';
 import { NextResponse, type NextRequest } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 
-/**
- * Handles the redirect back from Supabase after GitHub OAuth or a
- * magic-link click. Exchanges the one-time `code` for a session and
- * sets the auth cookies, then sends the user on to where they meant
- * to go (or /dashboard by default).
- */
+/** OAuth and default magic links return a PKCE code. Custom email templates can return a token hash. */
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url);
-  const code = searchParams.get('code');
-  const redirectTo = getSafeAuthRedirect(searchParams.get('redirectTo'), origin);
+  const origin = getAppOrigin();
+  const params = request.nextUrl.searchParams;
+  const destination = params.get('redirectTo');
+  const code = params.get('code');
+  const tokenHash = params.get('token_hash');
+  const redirect = (url: URL) => NextResponse.redirect(url, { headers: { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' } });
+  const fail = () => redirect(loginUrl(origin, destination, true));
 
-  if (code) {
+  if (params.has('error') || params.has('error_code') ||
+      params.getAll('code').length > 1 || params.getAll('token_hash').length > 1 ||
+      !(code && !params.has('token_hash') || !params.has('code') && tokenHash && params.get('type') === 'email')) return fail();
+
+  try {
     const supabase = await createSupabaseServerClient();
-    const { error } = await supabase.auth.exchangeCodeForSession(code);
-
-    if (error) {
-      const failUrl = new URL('/login', origin);
-      failUrl.searchParams.set('error', 'auth_callback_failed');
-      return NextResponse.redirect(failUrl);
-    }
+    const result = code ? await supabase.auth.exchangeCodeForSession(code) :
+      await supabase.auth.verifyOtp({ type: 'email', token_hash: tokenHash! });
+    return result.error || !result.data.session ? fail() : redirect(getSafeAuthRedirect(destination, origin));
+  } catch {
+    return fail();
   }
-
-  return NextResponse.redirect(redirectTo);
 }

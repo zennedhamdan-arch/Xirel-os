@@ -1,4 +1,4 @@
-import { createServerClient, type CookieOptions } from '@supabase/ssr';
+import { createServerClient, type SetAllCookies } from '@supabase/ssr';
 import { cookies } from 'next/headers';
 
 /**
@@ -19,23 +19,12 @@ export async function createSupabaseServerClient() {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-        get(name: string) {
-          return cookieStore.get(name)?.value;
-        },
-        set(name: string, value: string, options: CookieOptions) {
+        getAll: () => cookieStore.getAll(),
+        setAll(values: Parameters<SetAllCookies>[0]) {
           try {
-            cookieStore.set({ name, value, ...options });
+            for (const { name, value, options } of values) cookieStore.set(name, value, options);
           } catch {
-            // Called from a Server Component during render — the
-            // middleware below is what actually persists the refresh,
-            // so a failed set() here is expected and safe to ignore.
-          }
-        },
-        remove(name: string, options: CookieOptions) {
-          try {
-            cookieStore.set({ name, value: '', ...options });
-          } catch {
-            // See note above.
+            // Server Components are read-only. Middleware persists refreshes.
           }
         },
       },

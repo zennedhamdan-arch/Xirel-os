@@ -10,6 +10,10 @@
 # directly to Supabase Postgres via DATABASE_URL, claims durable jobs
 # with SKIP LOCKED, and drains on SIGTERM (see worker/index.ts).
 #
+# Web is not defined in this blueprint. Stage the web app separately from
+# the same pinned SHA and staging database; validate docs/staging-validation.md
+# before activating either service. Do not set AGENT_EXEC_* on Render.
+#
 # SECRETS: every credential is `sync: false` — set it in the Render
 # dashboard, never in this file.
 

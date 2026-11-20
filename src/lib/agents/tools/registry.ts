@@ -15,6 +15,7 @@ import { githubScope, webSearchKey } from '@/lib/connectors/read-only';
 import { githubReadTool, webSearchTool, githubPublishTool, githubInspectTool, webPageTool } from './external';
 
 import { projectFileTool, projectEditTool, projectCommandTool } from './worktree';
+import { namespaceRunnerEnabled } from '@/lib/execution/sandbox';
 import { projectScope } from '@/lib/execution/files';
 import { githubWriteScope } from '@/lib/connectors/github-changes';
 import { allowedResearchOrigins } from '@/lib/connectors/research';
@@ -45,7 +46,7 @@ export function getAllTools(workspaceId?: string, projectId?: string | null, dur
   return Object.values(TOOL_REGISTRY).filter(tool => {
     if (tool === githubPublishTool) return durable && !!githubWriteScope(workspaceId, projectId);
     if (tool === projectFileTool || tool === projectEditTool) return durable && !!projectScope(workspaceId, projectId);
-    if (tool === projectCommandTool) return durable && !!projectScope(workspaceId, projectId) && process.env.AGENT_EXEC_ENABLE === 'namespaces';
+    if (tool === projectCommandTool) return durable && !!projectScope(workspaceId, projectId) && namespaceRunnerEnabled();
     if (tool === webPageTool) return allowedResearchOrigins(workspaceId).size > 0;
     if (tool === githubReadTool || tool === githubInspectTool) return !!workspaceId && !!githubScope(workspaceId);
     if (tool === webSearchTool) return !!workspaceId && !!webSearchKey(workspaceId);

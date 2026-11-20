@@ -1,5 +1,7 @@
-import { createServerClient, type CookieOptions } from '@supabase/ssr';
+import { createServerClient, type SetAllCookies } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
+import { getAppOrigin } from '@/lib/auth/app-origin';
+import { getSafeAuthRedirect, loginUrl } from '@/lib/auth/redirect';
 
 /**
  * Runs on every matched request. Two jobs:
@@ -21,18 +23,13 @@ export async function middleware(request: NextRequest) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-        get(name: string) {
-          return request.cookies.get(name)?.value;
-        },
-        set(name: string, value: string, options: CookieOptions) {
-          request.cookies.set({ name, value, ...options });
-          response = NextResponse.next({ request: { headers: request.headers } });
-          response.cookies.set({ name, value, ...options });
-        },
-        remove(name: string, options: CookieOptions) {
-          request.cookies.set({ name, value: '', ...options });
-          response = NextResponse.next({ request: { headers: request.headers } });
-          response.cookies.set({ name, value: '', ...options });
+        getAll: () => request.cookies.getAll(),
+        setAll(values: Parameters<SetAllCookies>[0]) {
+          for (const { name, value } of values) request.cookies.set(name, value);
+          const refreshed = NextResponse.next({ request });
+          for (const cookie of response.cookies.getAll()) refreshed.cookies.set(cookie);
+          for (const { name, value, options } of values) refreshed.cookies.set(name, value, options);
+          response = refreshed;
         },
       },
     }
@@ -42,19 +39,22 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const isProtectedRoute =
-    request.nextUrl.pathname.startsWith('/dashboard') ||
-    request.nextUrl.pathname.startsWith('/onboarding');
-  const isAuthRoute = request.nextUrl.pathname.startsWith('/login');
-
-  if (isProtectedRoute && !user) {
-    const redirectUrl = new URL('/login', request.url);
-    redirectUrl.searchParams.set('redirectTo', request.nextUrl.pathname);
-    return NextResponse.redirect(redirectUrl);
+  const { pathname, search, searchParams } = request.nextUrl;
+  const isProtectedRoute = ['/dashboard', '/onboarding', '/command', '/chat'].some(
+    path => pathname === path || pathname.startsWith(`${path}/`),
+  );
+  const isAuthRoute = pathname === '/login' || pathname === '/login/';
+  function redirectWithCookies(url: URL) {
+    const result = NextResponse.redirect(url, { headers: { 'Cache-Control': 'no-store' } });
+    for (const cookie of response.cookies.getAll()) result.cookies.set(cookie);
+    return result;
   }
 
+  if (isProtectedRoute && !user) {
+    return redirectWithCookies(loginUrl(getAppOrigin(), `${pathname}${search}`));
+  }
   if (isAuthRoute && user) {
-    return NextResponse.redirect(new URL('/dashboard', request.url));
+    return redirectWithCookies(getSafeAuthRedirect(searchParams.get('redirectTo'), getAppOrigin()));
   }
 
   return response;

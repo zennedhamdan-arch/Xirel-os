@@ -42,6 +42,9 @@ async function main() {
         assert.equal(fs.existsSync('/project/.env'), false);
         assert.equal(fs.existsSync('/proc/1/cwd/project/.env'), false);
         assert.equal(Object.keys(os.networkInterfaces()).filter(x => x !== 'lo').length, 0);
+        const limits = fs.readFileSync('/proc/self/limits', 'utf8');
+        assert.match(limits, /Max cpu time\\s+20\\s+20/);
+        assert.match(limits, /Max address space\\s+3221225472\\s+3221225472/);
         fs.writeFileSync('/project/sample.txt', 'throwaway change');
       });`);
     await writeFile(join(root, 'package.json'), JSON.stringify({ scripts: {
@@ -63,8 +66,18 @@ async function main() {
     assert.ok(noisy.stdout.length + noisy.stderr.length <= 24_000);
     await writeFile(join(root, 'package.json'), JSON.stringify({ scripts: { build: 'node -e "setInterval(()=>{},1000)"' } }));
     await pinPackage();
+    process.env.RENDER = 'true';
+    await assert.rejects(runProjectPreset(root, 'node-test'), /not enabled on this host/);
+    delete process.env.RENDER;
     const cancelled = await runProjectPreset(root, 'build', AbortSignal.timeout(750));
     assert.equal(cancelled.status, 'cancelled');
+    if (process.env.RUN_FULL_SANDBOX_TIMEOUT === '1') {
+      const started = Date.now();
+      const timeout = await runProjectPreset(root, 'build');
+      assert.equal(timeout.status, 'timeout');
+      assert.ok(Date.now() - started < 36_000);
+      console.log('Real 30-second isolated preset deadline passed.');
+    }
     console.log('Project sandbox checks passed (paths, hard links, file CAS, runtime isolation, presets, output limit, cancellation).');
   } finally {
     await Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]);

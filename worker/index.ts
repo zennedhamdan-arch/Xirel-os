@@ -24,18 +24,19 @@ function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 const WORKER_ID =
   process.env.WORKER_ID?.trim() || `${process.env.HOSTNAME || 'worker'}-${process.pid}`;
 const CONCURRENCY = Math.min(envInt('WORKER_CONCURRENCY', 2), 10);
-const LEASE_SECONDS = Math.min(envInt('WORKER_LEASE_SECONDS', 300), 3600);
+// Claiming already clamps lease duration to 30–3600s. Renew with the same duration.
+const LEASE_SECONDS = Math.min(Math.max(envInt('WORKER_LEASE_SECONDS', 300), 30), 3600);
 const POLL_MS = envInt('WORKER_POLL_MS', 2_000);
-const HEARTBEAT_MS = envInt('WORKER_HEARTBEAT_MS', 15_000);
+const HEARTBEAT_MS = Math.min(envInt('WORKER_HEARTBEAT_MS', 15_000), Math.floor(LEASE_SECONDS * 1000 / 3));
 const SCHEDULER_MS = envInt('WORKER_SCHEDULER_MS', 30_000);
 const GRACE_MS = envInt('WORKER_GRACE_MS', 25_000);
-const VERSION = process.env.RENDER_GIT_COMMIT?.slice(0, 12) ?? 'dev';
+const VERSION = process.env.RENDER_GIT_COMMIT ?? process.env.XIREL_APP_REVISION ?? 'dev';
 
 const DEFAULT_PROVIDERS: AiProviderId[] = ['gemini', 'openrouter', 'groq'];
 
@@ -175,7 +176,7 @@ async function drainAndExit(signal: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  log(`starting — concurrency=${CONCURRENCY} lease=${LEASE_SECONDS}s poll=${POLL_MS}ms`);
+  log(`starting — revision=${VERSION} concurrency=${CONCURRENCY} lease=${LEASE_SECONDS}s poll=${POLL_MS}ms`);
   if (!process.env.DATABASE_URL) {
     console.error('DATABASE_URL is required — refusing to start.');
     process.exit(1);

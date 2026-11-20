@@ -1,7 +1,7 @@
 /** Real routes, Drizzle, SQL, scheduler, and worker; only session and AI transport are substituted. */
 import Module from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { drizzle } from 'drizzle-orm/postgres-js';
@@ -17,6 +17,7 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
   let objectives: string[] = [];
   let plan = '{"steps":[{"description":"Answer from context"}]}';
   let toolCall: { name: string; arguments: Record<string, unknown> } | undefined;
+  let repairScript: ((req: AiRequest) => { name: string; arguments: Record<string, unknown> } | null) | undefined;
   let scriptedCalls: Record<string, Record<string, unknown>> = {};
   const queries: string[] = [];
   const db = drizzle(sql, { schema, logger: { logQuery: query => queries.push(query) } });
@@ -28,9 +29,11 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
       if (!planning) objectives.push(req.messages.map(m => m.content).join('\n'));
       const tool = toolCall ?? Object.entries(scriptedCalls).map(([name, args]) => ({ name, arguments: args }))
         .find(candidate => req.messages.some(m => m.content.includes(`Required tool: ${candidate.name}`)));
-      const requested = !planning && tool && req.tools?.some(t => t.name === tool.name) &&
+      const standard = !planning && tool && req.tools?.some(t => t.name === tool.name) &&
         req.messages.some(m => m.content.includes(`Required tool: ${tool.name}`)) && !req.messages.some(m => m.role === 'tool') ? tool : null;
-      return { providerId: 'gemini', text: planning ? plan : 'Test-provider response', finishReason: requested ? 'tool_calls' : 'stop',
+      const requested = !planning && repairScript ? repairScript(req) ?? standard : standard;
+      const repaired = !planning && repairScript && req.messages.some(m => m.name === 'project_command' && JSON.parse(m.content).output?.status === 'passed');
+      return { providerId: 'gemini', text: planning ? plan : repaired ? 'Repaired addition.js and confirmed the isolated test passed.' : 'Test-provider response', finishReason: requested ? 'tool_calls' : 'stop',
         toolCalls: requested ? [{ id: 'check', ...requested }] : [] };
     },
     async *routeStreamText(req: AiRequest) {
@@ -147,6 +150,22 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
     check('project is created through the authenticated API', project.ok && typeof projectId === 'string');
     const note = await projectPost(request({ action: 'remember', workspaceId: ids.a, projectId, kind: 'decision', key: 'architecture', content: 'Keep the existing isolated Postgres queue' }));
     check('project decision persists through the authenticated API', note.ok);
+    const { POST: changeJob } = require('../src/app/api/agent/jobs/[id]/actions/route') as typeof import('../src/app/api/agent/jobs/[id]/actions/route');
+    const cancelledFixture = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Cancellation fixture', description: 'Exercise owner cancellation' });
+    const [cancelClaim] = await queue.claimDueJobs({ workerId: 'cancel-api-test' });
+    if (!cancelClaim || cancelClaim.id !== cancelledFixture.job.id) throw new Error('Cancellation fixture not claimed');
+    await queue.transitionJob(cancelClaim.id, 'cancel-api-test', 'running');
+    const linkedCancelTask = await queue.attachJobTask(cancelClaim.id, 'cancel-api-test');
+    const cancel = () => changeJob(request({ action: 'cancel' }), { params: Promise.resolve({ id: cancelClaim.id }) });
+    userId = ids.other;
+    const notOwner = await cancel();
+    userId = ids.user;
+    const ownerCancelled = await cancel();
+    const cancelledJob = await queue.getJob(cancelClaim.id);
+    const [cancelledTask] = await sql`select status from tasks where id=${linkedCancelTask}`;
+    check('protected cancellation denies nonowner then atomically clears owner job lease and cancels linked task', notOwner.status === 404 &&
+      ownerCancelled.ok && cancelledJob?.status === 'cancelled' && cancelledJob.leaseOwner === null && cancelledTask?.status === 'cancelled');
+
     const createWork = (data: Record<string, unknown>) => projectTask(request({ action: 'create', workspaceId: ids.a, projectId, ...data }));
     const dependency = await createWork({ title: 'Predecessor' });
     const { id: dependencyId } = await dependency.json();
@@ -198,16 +217,21 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
         !!file && research[0]?.sourceUrl === 'https://example.org/reference');
     } finally { globalThis.fetch = originalFetch; }
 
+    const fixtureProject = await projectPost(request({ action: 'create', workspaceId: ids.a, name: 'Staging Addition Fixture', description: 'Disposable repair test' }));
+    const fixtureProjectId = (await fixtureProject.json()).id as string;
+    const fixtureMemory = 'The addition helper should add two numeric operands; use the built-in Node test runner.';
+    const memoryReply = await projectPost(request({ action: 'remember', workspaceId: ids.a, projectId: fixtureProjectId, kind: 'decision', key: 'staging-requirement', content: fixtureMemory }));
+    check('dedicated throwaway project and project memory created via protected API', fixtureProject.ok && memoryReply.ok);
     const fixture = await mkdtemp(join(tmpdir(), 'xirel-worker-tool-test-'));
     const gitSha = 'a'.repeat(40);
     const treeSha = 'b'.repeat(40);
     const commitSha = 'c'.repeat(40);
     const settings: Record<string, string> = {
-      AGENT_EXEC_ROOT: fixture, AGENT_EXEC_WORKSPACE_ID: ids.a, AGENT_EXEC_PROJECT_ID: projectId,
+      AGENT_EXEC_ROOT: fixture, AGENT_EXEC_WORKSPACE_ID: ids.a, AGENT_EXEC_PROJECT_ID: fixtureProjectId,
       AGENT_EXEC_ENABLE: 'namespaces', AGENT_EXEC_PRESETS: 'node-test',
       AGENT_GITHUB_WORKSPACE_ID: ids.a, AGENT_GITHUB_REPOSITORY: 'sample/isolated', AGENT_GITHUB_REF: 'main',
       AGENT_GITHUB_READ_TOKEN: 'mock-read', AGENT_GITHUB_WRITE_TOKEN: 'mock-write', AGENT_GITHUB_BASE_BRANCH: 'main',
-      AGENT_GITHUB_SHARED_FILES: 'test.js', OPENROUTER_API_KEY: 'mock-model',
+      AGENT_GITHUB_SHARED_FILES: 'addition.js,test.js', OPENROUTER_API_KEY: 'mock-model',
     };
     const retrieval = require('../src/lib/ai/providers/openrouter-retrieval') as typeof import('../src/lib/ai/providers/openrouter-retrieval');
     settings.OPENROUTER_EMBED_MODEL = retrieval.OPENROUTER_SELECTED_MODELS.embed;
@@ -255,22 +279,57 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
       try { research.validateResearchUrl('https://allowed.example@localhost/secret', new Set(['https://allowed.example'])); } catch { rejected = true; }
       check('research policy validates the target origin, not the URL prefix', rejected);
 
-      const fileText = 'const test = require("node:test"); test("safe fixture", () => {});';
-      scriptedCalls = { project_edit: { kind: 'create', path: 'test.js', text: fileText }, project_command: { preset: 'node-test' } };
-      plan = '{"steps":[{"description":"Write fixture","toolHint":"project_edit"},{"description":"Run isolated tests","toolHint":"project_command"}]}';
-      const fixtureJob = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'worktree', description: 'Author and run test', projectId });
+      await writeFile(join(fixture, 'addition.js'), 'exports.add = (a, b) => a - b;\n');
+      await writeFile(join(fixture, 'test.js'), `const test = require('node:test');
+        const assert = require('node:assert/strict'); const { add } = require('./addition');
+        test('adds numeric operands', () => assert.equal(add(7, 5), 12));`);
+      let readHash: string | undefined;
+      let receivedMemory = false;
+      let sawFailure = false;
+      scriptedCalls = { resolve_project: { reference: 'Staging Addition Fixture' }, project_file: { operation: 'read', path: 'addition.js' } };
+      plan = JSON.stringify({ steps: [{ description: 'Resolve Staging Addition Fixture', toolHint: 'resolve_project' },
+        { description: 'Inspect addition helper', toolHint: 'project_file' }, { description: 'Diagnose and repair the failing addition test', toolHint: null }] });
+      repairScript = req => {
+        const results = req.messages.filter(m => m.role === 'tool').map(m => ({ name: m.name, payload: JSON.parse(m.content) }));
+        if (results.some(result => result.name === 'resolve_project' && result.payload.output?.project?.id === fixtureProjectId && JSON.stringify(result.payload.output.memory).includes(fixtureMemory))) receivedMemory = true;
+        const file = results.find(result => result.name === 'project_file');
+        if (file?.payload.output?.text.includes('a - b')) readHash = file.payload.output.sha256;
+        if (!req.messages.some(m => m.content.includes('Current plan step 3/3'))) return null;
+        if (results.length === 0) return { name: 'project_command', arguments: { preset: 'node-test' } };
+        if (results.length === 1 && results[0]?.payload.output?.status === 'failed' && /12/.test(results[0]?.payload.output?.stdout ?? '') && readHash) {
+          sawFailure = true;
+          return { name: 'project_edit', arguments: { kind: 'patch', path: 'addition.js', sha256: readHash, find: 'a - b', replace: 'a + b' } };
+        }
+        if (results.length === 2 && results[1]?.payload.success) return { name: 'project_command', arguments: { preset: 'node-test' } };
+        return null;
+      };
+      const objective = 'In Staging Addition Fixture, repair the addition helper, run the existing test, and report the result.';
+      const submittedFixture = await submit(request({ workspaceId: ids.a, title: 'Repair addition', description: objective, projectId: fixtureProjectId }));
+      const fixtureJobId = (await submittedFixture.json()).job?.id;
       const [fixtureClaim] = await queue.claimDueJobs({ workerId: 'worktree-worker' });
-      if (!fixtureClaim || fixtureClaim.id !== fixtureJob.job.id) throw new Error('Worktree job was not claimable');
+      if (!fixtureClaim || !submittedFixture.ok || fixtureClaim.id !== fixtureJobId) throw new Error('Worktree job was not claimable');
       const execute = (job: typeof fixtureClaim, workerId: string) => executeJob(job, { workerId, providerPriority: ['gemini'], signal: new AbortController().signal });
       const workResult = await execute(fixtureClaim, 'worktree-worker');
-      check('actual durable worker edits the configured worktree and runs real isolated Node tests', workResult.outcome === 'completed');
-      const [audit] = await sql`select count(*)::int as count from tool_executions where run_id=${workResult.runId!} and tool_name='project_command' and success`;
-      check('isolated project command is recorded against its run', audit?.count === 1);
-      const written = await commands.readProjectFile(fixture, 'test.js');
+      repairScript = undefined;
+      check('durable job resolves project, retrieves memory and inspects the staged file', receivedMemory && !!readHash && objectives.some(item => item.includes(objective)));
+      const audit = await sql`select success,output from tool_executions where run_id=${workResult.runId!} and tool_name='project_command' order by created_at,id`;
+      check('real sandbox runs fail → patch → pass and persist both command results', sawFailure && workResult.outcome === 'completed' && audit.length === 2 &&
+        audit[0]?.success === false && audit[0]?.output?.exitCode === 1 && audit[1]?.success === true && audit[1]?.output?.exitCode === 0);
+      const { GET: getRunDetail } = require('../src/app/api/agent/runs/[id]/route') as typeof import('../src/app/api/agent/runs/[id]/route');
+      const report = await getRunDetail(get('/'), { params: Promise.resolve({ id: workResult.runId! }) });
+      const timeline = await report.json();
+      check('protected timeline contains the three planned steps, failed and green commands, and final report', report.ok && timeline.run.projectId === fixtureProjectId &&
+        timeline.steps.filter((step: { stepType: string }) => step.stepType === 'plan').length === 3 &&
+        timeline.steps.some((step: { text?: string }) => step.text?.includes('node-test: failed')) &&
+        timeline.steps.some((step: { text?: string }) => step.text?.includes('node-test: passed')) &&
+        timeline.steps.some((step: { stepType: string; status: string; text?: string }) => step.stepType === 'respond' && step.status === 'completed' &&
+          step.text?.includes('Repaired addition.js and confirmed the isolated test passed.')));
+      const written = await commands.readProjectFile(fixture, 'addition.js');
+      check('repaired worktree hash differs and authorized file contains correct addition', written.sha256 !== readHash && written.text.includes('a + b'));
       plan = '{"steps":[{"description":"Publish the reviewed fixture","toolHint":"github_publish_change"}]}';
       scriptedCalls = { github_publish_change: { repository: 'sample/isolated', baseBranch: 'main', baseSha: gitSha,
-        headBranch: 'xirel/fixture', title: 'Prepare fixture', files: [{ path: 'test.js', sha256: written.sha256 }], openPullRequest: true } };
-      const publication = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Publish fixture', description: 'Publish reviewed fixture', projectId });
+        headBranch: 'xirel/fixture', title: 'Prepare fixture', files: [{ path: 'addition.js', sha256: written.sha256 }], openPullRequest: true } };
+      const publication = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Publish fixture', description: 'Publish reviewed fixture', projectId: fixtureProjectId });
       const [publishClaim] = await queue.claimDueJobs({ workerId: 'publish-worker' });
       if (!publishClaim || publishClaim.id !== publication.job.id) throw new Error('Publication was not claimable');
       const beforeApproval = outbound.length;
@@ -295,7 +354,7 @@ export async function testAppIntegration(sql: postgres.Sql, check: Check, ids: {
         JSON.stringify(changes).includes('+fixture') && !JSON.stringify(changes).includes('+not shared') && JSON.stringify(checks).includes('success'));
 
       scriptedCalls.github_publish_change = { ...scriptedCalls.github_publish_change, headBranch: 'xirel/partial' };
-      const partial = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Partial publication', description: 'Publish the second reviewed fixture', projectId });
+      const partial = await queue.submitJob({ workspaceId: ids.a, createdBy: ids.user, title: 'Partial publication', description: 'Publish the second reviewed fixture', projectId: fixtureProjectId });
       const [partialClaim] = await queue.claimDueJobs({ workerId: 'partial-worker' });
       if (!partialClaim || partialClaim.id !== partial.job.id) throw new Error('Partial publication was not claimable');
       const partialPark = await execute(partialClaim, 'partial-worker');

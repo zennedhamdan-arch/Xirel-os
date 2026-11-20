@@ -8,9 +8,13 @@ import { assertProjectRoot, readProjectFile, validComponent } from './files';
 export const presets = ['test', 'build', 'node-test'] as const;
 export type Preset = typeof presets[number];
 
+export function namespaceRunnerEnabled() {
+  return process.platform === 'linux' && !!process.getuid?.() && !process.env.RENDER && process.env.AGENT_EXEC_ENABLE === 'namespaces';
+}
+
 /** Fail closed: no direct command execution if namespaces, mounts, chroot or resource caps fail. */
 export async function runProjectPreset(root: string, preset: Preset, signal?: AbortSignal) {
-  if (process.platform !== 'linux' || process.env.AGENT_EXEC_ENABLE !== 'namespaces') throw new Error('Linux namespace runner is not enabled');
+  if (!namespaceRunnerEnabled()) throw new Error('Linux namespace runner is not enabled on this host');
   if (!presets.includes(preset)) throw new Error('Command is not an approved preset');
   const configuredPresets = (process.env.AGENT_EXEC_PRESETS ?? '').split(',').map(s => s.trim());
   if (!configuredPresets.includes(preset)) throw new Error('Preset is not configured');

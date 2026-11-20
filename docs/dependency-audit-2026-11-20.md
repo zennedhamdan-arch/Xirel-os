@@ -1,5 +1,7 @@
 # Dependency audit and Next.js upgrade — 2026-11-20 UTC
 
+> This is the baseline audit for the Next.js upgrade. The [staging follow-up](staging-validation.md#database-and-dependency-results) removes the minimatch and selector-parser findings.
+
 Registry: public npm. Commands: `npm audit --json`, `npm audit --omit=dev --json`. Reports count **affected package entries**, not distinct advisory IDs. The lockfiles, reports, and application configuration were reviewed locally, not the currently deployed service.
 
 | Snapshot | Critical | High | Moderate | Full raw report |

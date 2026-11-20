@@ -62,6 +62,7 @@ export async function GET(request: Request) {
 
     return NextResponse.json({
       executionPaused: paused,
+      webRevision: isGlobalAdmin ? (process.env.RENDER_GIT_COMMIT ?? process.env.XIREL_APP_REVISION ?? null) : undefined,
       workerOnline: workers.length ? workers.some(w => now - new Date(w.lastHeartbeatAt).getTime() < 60_000) : null,
       queue: {
         byStatus: statuses,

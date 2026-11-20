@@ -2,9 +2,10 @@ import 'server-only';
 import type { AiProviderId, AiRequest, AiResponse } from '../types';
 import { AiProviderError } from '../types';
 import { getProvider } from '../registry';
-import { classifyError } from '@/lib/jobs/errors';
+import { classifyError, isTransient, ProviderRouteFailure, type ClassifiedError } from '@/lib/jobs/errors';
 import {
   cooldownRemainingMs,
+  getProviderHealthSnapshot,
   recordProviderFailure,
   recordProviderSuccess,
 } from './health';
@@ -77,6 +78,7 @@ function classifyProviderError(err: unknown) {
 
 export async function routeGenerateText(request: RouteRequest): Promise<RouteResult> {
   const failedProviders: RouteResult['failedProviders'] = [];
+  const classifications: ClassifiedError[] = [];
   const candidates = request.providerPriority.slice(0, MAX_ATTEMPTS);
 
   if (candidates.length === 0) {
@@ -100,6 +102,9 @@ export async function routeGenerateText(request: RouteRequest): Promise<RouteRes
     // the next candidate instead of burning a doomed attempt.
     const coolingMs = cooldownRemainingMs(providerId);
     if (coolingMs > 0) {
+      const errorClass = getProviderHealthSnapshot().find(item => item.providerId === providerId)?.lastErrorClass ?? 'unknown';
+      classifications.push({ errorClass, failureClass: isTransient(errorClass) ? 'transient' : 'permanent',
+        retryAfterMs: coolingMs, message: 'Provider is cooling down' });
       failedProviders.push({
         providerId,
         error: `cooldown (${Math.ceil(coolingMs / 1000)}s remaining after last failure)`,
@@ -117,11 +122,8 @@ export async function routeGenerateText(request: RouteRequest): Promise<RouteRes
       request.signal?.throwIfAborted();
       const classified = classifyProviderError(err);
       recordProviderFailure(providerId, classified);
-      const message = err instanceof AiProviderError ? err.message : String(err);
-      failedProviders.push({
-        providerId,
-        error: `${message.slice(0, 300)} [${classified.errorClass}]`,
-      });
+      classifications.push(classified);
+      failedProviders.push({ providerId, error: classified.errorClass });
 
       // Non-retryable errors (bad request, auth failure, etc.) still fall
       // through to the next provider here — a provider being broken for
@@ -132,10 +134,10 @@ export async function routeGenerateText(request: RouteRequest): Promise<RouteRes
     }
   }
 
-  throw new Error(
-    `All ${candidates.length} candidate provider(s) failed or were unconfigured: ` +
-      failedProviders.map((f) => `${f.providerId} (${f.error})`).join(', ')
-  );
+  const transient = classifications.filter(item => item.failureClass === 'transient');
+  const selected = transient[0] ?? classifications[0] ?? classifyError({ message: 'No configured provider was available' });
+  throw new ProviderRouteFailure({ ...selected, message: `Provider routing failed (${selected.errorClass})`,
+    retryAfterMs: transient.length ? Math.max(0, ...transient.map(item => item.retryAfterMs ?? 0)) : null });
 }
 
 export async function* routeStreamText(

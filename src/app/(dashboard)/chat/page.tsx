@@ -1,4 +1,6 @@
 import { redirect } from 'next/navigation';
+import { getAppOrigin } from '@/lib/auth/app-origin';
+import { loginUrl } from '@/lib/auth/redirect';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
 import { workspaceMembers } from '@/lib/db/schema';
@@ -17,7 +19,8 @@ export default async function ChatPage({
   } = await supabase.auth.getUser();
 
   if (!user) {
-    redirect('/login');
+    const { workspace } = await searchParams;
+    redirect(loginUrl(getAppOrigin(), workspace ? `/chat?${new URLSearchParams({ workspace })}` : '/chat').href);
   }
 
   // Check if Phase 2 database migration has been run

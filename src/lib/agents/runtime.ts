@@ -7,6 +7,7 @@ import { verifyToolExecution, type VerificationReport } from './verification';
 import { addEvent, beginPlanStep, createRun, finishStep, startStep, updateRunStatus } from './runs';
 import { embedOpenRouter, rerankOpenRouter, OPENROUTER_SELECTED_MODELS } from '@/lib/ai/providers/openrouter-retrieval';
 import { getWorkspaceRole } from '@/lib/jobs/task-helpers';
+import { ProviderRouteFailure, type ClassifiedError } from '@/lib/jobs/errors';
 import { getAllTools } from './tools/registry';
 
 export interface AgentTurnRequest {
@@ -42,6 +43,7 @@ export interface AgentTurnResult {
   planSource: 'model' | 'deterministic_fallback' | 'skipped';
   verification: VerificationReport;
   error: string | null;
+  providerFailure?: ClassifiedError;
   newMessages: AiMessage[];
   pendingAction?: PendingAction;
 }
@@ -213,9 +215,10 @@ export async function runAgentTurn(request: AgentTurnRequest): Promise<AgentTurn
       result.newMessages.push({ role: 'assistant', content: result.text });
     }
   } catch (error) {
+    if (!signal.aborted && error instanceof ProviderRouteFailure) result.providerFailure = error.classification;
     // Provider responses and tool exceptions can contain private payloads; keep raw errors out of API-visible state.
     result.error = error instanceof Error && error.message === 'Worktree edits and external publication must be separate jobs' ? error.message : signal.aborted ? 'Execution cancelled or deadline exceeded' :
-      error instanceof Error && /provider|timeout/i.test(error.message) ? 'Provider unavailable or timed out' : 'Execution did not complete';
+      result.providerFailure?.message ?? 'Execution did not complete';
     result.status = 'failed';
     const current = planRecords[index];
     if (current) await finishStep(current.id, 'failed', { error: result.error });

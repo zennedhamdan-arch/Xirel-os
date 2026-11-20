@@ -1,5 +1,7 @@
 # Xirel OS — Phase 2 Status Report
 
+> Historical deployment notes. For current Render authentication configuration, see [Render authentication setup](docs/render-authentication.md).
+
 **Date:** August 19, 2026  
 **Phase:** Phase 2 (AI Command Center) — COMPLETE  
 **Overall Status:** ✅ Ready for Production Deployment
@@ -24,7 +26,7 @@ Phase 2 is complete and fully functional. The codebase is type-safe, thoroughly 
 ## Current Deployment Status
 
 ### Phase 1: ✅ LIVE IN PRODUCTION
-- **URL:** https://xirel-os-rwgv.vercel.app
+- **URL at the time:** retired Vercel deployment; see the Render authentication guide above.
 - **Features:** Authentication, Workspace Management, AI Provider Detection
 - **Status:** Fully operational
 
@@ -138,7 +140,7 @@ Vercel auto-deploys on push.
 4. Click Run
 
 ### Step 4: Test Chat Interface (2 minutes)
-1. Go to https://xirel-os-rwgv.vercel.app/chat
+1. Go to https://xirel-os.onrender.com/chat
 2. Send test message
 3. Verify streaming response
 4. Refresh page → check persistence

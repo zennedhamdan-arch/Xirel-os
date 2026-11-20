@@ -146,3 +146,11 @@ export function classifyThrownError(error: unknown): ClassifiedError {
   }
   return classifyError({ message: String(error) });
 }
+
+/** Safe aggregate failure from ordered text routing; never carries a provider body. */
+export class ProviderRouteFailure extends Error {
+  constructor(readonly classification: ClassifiedError) {
+    super(classification.message);
+    this.name = 'ProviderRouteFailure';
+  }
+}

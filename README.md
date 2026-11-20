@@ -73,6 +73,12 @@ providers are skipped, never faked. Render configuration lives in
 
 See [project execution and rollout](docs/project-execution.md) for the staging worktree, Linux presets, approval-bound GitHub publishing, public research and OpenRouter role configuration. See the [dependency audit](docs/dependency-audit-2026-11-20.md) for the Next.js upgrade and remaining development-only findings.
 
+## Staging validation
+
+See the [staging validation report and deployment procedure](docs/staging-validation.md) for local evidence, live probe instructions, and outstanding Render/Supabase gates.
+
+Production authentication uses `APP_URL` as its trusted origin. See [Render authentication setup](docs/render-authentication.md) before changing Supabase URL configuration or deploying.
+
 ## Deployment status
 
 Phase 1–4 AI OS code complete and tested (logic + real-DB suites);

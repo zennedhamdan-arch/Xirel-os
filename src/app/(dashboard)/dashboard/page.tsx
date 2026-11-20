@@ -1,4 +1,6 @@
 import { redirect } from 'next/navigation';
+import { getAppOrigin } from '@/lib/auth/app-origin';
+import { loginUrl } from '@/lib/auth/redirect';
 import Link from 'next/link';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
@@ -14,7 +16,7 @@ export default async function DashboardPage() {
   } = await supabase.auth.getUser();
 
   if (!user) {
-    redirect('/login');
+    redirect(loginUrl(getAppOrigin(), '/dashboard').href);
   }
 
   const memberships = await db
@@ -39,7 +41,7 @@ export default async function DashboardPage() {
             <h1 className="text-2xl font-semibold">What do you want your AI team to do?</h1>
             <p className="mt-1 text-sm text-muted">Signed in as {user.email}</p>
           </div>
-          <SignOutButton />
+          <SignOutButton origin={getAppOrigin()} />
         </div>
 
         {configuredProviders.length > 0 && firstWorkspace && (

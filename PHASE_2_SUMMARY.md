@@ -1,5 +1,7 @@
 # Xirel OS — Phase 2 Implementation Summary
 
+> Historical deployment notes. For current Render authentication configuration, see [Render authentication setup](docs/render-authentication.md).
+
 **Commit:** `33049b8` - AI Command Center, OpenRouter integration, streaming chat
 
 ## What Was Built
@@ -101,7 +103,7 @@
 
 # 2. Add env vars
 OPENROUTER_API_KEY=sk-your-key-here
-NEXT_PUBLIC_APP_URL=https://xirel-os-rwgv.vercel.app  # Update to your domain
+NEXT_PUBLIC_APP_URL=https://xirel-os.onrender.com  # Update to your domain
 
 # 3. Redeploy (if env vars just added)
 # Vercel dashboard → Deployments → latest → ⋯ → Redeploy

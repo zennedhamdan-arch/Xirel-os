@@ -1,5 +1,7 @@
 # Phase 2 Deployment Guide — AI Command Center
 
+> Historical deployment notes. For current Render authentication configuration, see [Render authentication setup](docs/render-authentication.md).
+
 **Status:** ✅ Code complete and tested  
 **Last updated:** After Phase 2 consolidation and UI enhancements  
 **Current git commits:** `6ed3f32` and prior
@@ -98,7 +100,7 @@ Vercel will auto-deploy when code is pushed to main branch.
    - `DATABASE_URL` ✓ (should already be set from Phase 1)
    - `SUPABASE_SERVICE_ROLE_KEY` ✓ (should already be set from Phase 1)
    - `OPENROUTER_API_KEY` — your OpenRouter key (get from https://openrouter.ai/keys)
-   - `NEXT_PUBLIC_APP_URL` ✓ (should be `https://xirel-os-rwgv.vercel.app` or your domain)
+   - `NEXT_PUBLIC_APP_URL` (public integration metadata; current auth configuration is in the Render guide above)
 
 3. If you added OpenRouter key just now, **redeploy**:
    - Vercel dashboard → Deployments → Latest → ⋯ → Redeploy
@@ -107,7 +109,7 @@ Vercel will auto-deploy when code is pushed to main branch.
 
 1. **Navigate to Chat**
    ```
-   https://xirel-os-rwgv.vercel.app/chat
+   https://xirel-os.onrender.com/chat
    ```
 
 2. **If you see "Setup Required" message**
