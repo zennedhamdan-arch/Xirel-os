@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { and, desc, eq } from 'drizzle-orm';
 import { db } from '@/lib/db';
 import { agentSchedules } from '@/lib/db/schema';
-import { requireWorkspaceAccess } from '@/lib/api/guards';
+import { projectBelongsToWorkspace, requireWorkspaceAccess } from '@/lib/api/guards';
 import { rateLimit } from '@/lib/security/rate-limit';
 import { validateCron, nextCronRun } from '@/lib/schedules/cron';
 
@@ -83,6 +83,9 @@ export async function POST(request: Request) {
   }
 
   try {
+    if (input.projectId && !(await projectBelongsToWorkspace(guard.ctx.workspaceId, input.projectId))) {
+      return NextResponse.json({ error: 'Project not found' }, { status: 404 });
+    }
     const inserted = await db
       .insert(agentSchedules)
       .values({

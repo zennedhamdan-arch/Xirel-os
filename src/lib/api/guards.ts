@@ -4,11 +4,12 @@
  * "never trust a client-supplied workspace id" is enforced uniformly.
  */
 
+import 'server-only';
 import { NextResponse } from 'next/server';
 import { and, eq } from 'drizzle-orm';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
-import { workspaceMembers, type workspaceRoleEnum } from '@/lib/db/schema';
+import { projects, tasks, workspaceMembers, type workspaceRoleEnum } from '@/lib/db/schema';
 
 type WorkspaceRole = (typeof workspaceRoleEnum.enumValues)[number];
 
@@ -23,6 +24,7 @@ export interface WorkspaceAccessContext {
   userId: string;
   workspaceId: string;
   role: WorkspaceRole;
+  taskProjectId?: string | null;
 }
 
 type GuardResult =
@@ -38,23 +40,24 @@ export async function requireWorkspaceAccess(
   workspaceId: string | null | undefined,
   minRole: WorkspaceRole = 'viewer',
 ): Promise<GuardResult> {
-  const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (!workspaceId || !uuidLike.test(workspaceId)) {
-    return { ok: false, response: NextResponse.json({ error: 'workspaceId is required' }, { status: 400 }) };
-  }
+  const session = await requireUser();
+  if (!session.ok) return session;
+  return authorizeWorkspace(session.ctx.userId, workspaceId, minRole);
+}
 
-  const supabase = createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return { ok: false, response: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) };
-  }
+export const isUuid = (value: string | null | undefined): value is string =>
+  !!value && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 
+const denied = (status: number, error: string) =>
+  ({ ok: false as const, response: NextResponse.json({ error }, { status }) });
+
+async function authorizeWorkspace(userId: string, workspaceId: string | null | undefined, minRole: WorkspaceRole): Promise<GuardResult> {
+  if (!isUuid(workspaceId)) return denied(400, 'A valid workspaceId is required');
+  workspaceId = workspaceId.toLowerCase();
   const rows = await db
     .select({ role: workspaceMembers.role })
     .from(workspaceMembers)
-    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, user.id)))
+    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)))
     .limit(1);
 
   const membership = rows[0];
@@ -75,7 +78,7 @@ export async function requireWorkspaceAccess(
     };
   }
 
-  return { ok: true, ctx: { userId: user.id, workspaceId, role: membership.role } };
+  return { ok: true, ctx: { userId, workspaceId, role: membership.role } };
 }
 
 /** Authenticate only (no workspace context) — for system endpoints. */
@@ -92,4 +95,42 @@ export async function requireUser(): Promise<UserGuardResult> {
     return { ok: false, response: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) };
   }
   return { ok: true, ctx: { userId: user.id } };
+}
+
+/** Reads are workspace-shared; only the task owner or a workspace admin can continue it. */
+export async function requireTaskAccess(taskId: string, options: {
+  workspaceId?: string;
+  write?: boolean;
+} = {}): Promise<GuardResult> {
+  const session = await requireUser();
+  if (!session.ok) return session;
+  if (!isUuid(taskId)) return denied(400, 'A valid taskId is required');
+  const { userId } = session.ctx;
+  const resource = await db.select({ workspaceId: tasks.workspaceId, ownerId: tasks.userId, projectId: tasks.projectId })
+    .from(tasks)
+    .innerJoin(workspaceMembers, and(eq(workspaceMembers.workspaceId, tasks.workspaceId), eq(workspaceMembers.userId, userId)))
+    .where(eq(tasks.id, taskId)).limit(1);
+  const task = resource[0];
+  if (!task || (options.workspaceId !== undefined && task.workspaceId !== options.workspaceId.toLowerCase())) {
+    return denied(404, 'Task not found');
+  }
+  const access = await authorizeWorkspace(userId, task.workspaceId, options.write ? 'member' : 'viewer');
+  if (options.write && access.ok && !canManageOwnedResource(access.ctx, task.ownerId)) {
+    return denied(403, 'Only the task owner or a workspace admin can continue this task');
+  }
+  return access.ok ? { ok: true, ctx: { ...access.ctx, taskProjectId: task.projectId } } : access;
+}
+
+export function canManageOwnedResource(ctx: WorkspaceAccessContext, ownerId: string) {
+  return ROLE_RANK[ctx.role] >= ROLE_RANK.admin || (ROLE_RANK[ctx.role] >= ROLE_RANK.member && ctx.userId === ownerId);
+}
+
+export async function projectBelongsToWorkspace(workspaceId: string, projectId: string) {
+  const rows = await db.select({ id: projects.id }).from(projects)
+    .where(and(eq(projects.workspaceId, workspaceId), eq(projects.id, projectId))).limit(1);
+  return rows.length !== 0;
+}
+
+export function isPlatformAdmin(userId: string): boolean {
+  return (process.env.GLOBAL_ADMIN_USER_IDS ?? '').split(',').some(id => id.trim() === userId);
 }

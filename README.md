@@ -36,7 +36,7 @@ USER → VERCEL (Next.js frontend + authenticated API)
 ```
 
 Key sources of truth:
-- `supabase/migrations/0001…0008` — DDL + RLS (0007 fixes the
+- `supabase/migrations/0001…0011` — DDL + RLS (0007 fixes the
   `workspace_members` policy recursion; 0008 is the durable engine).
 - `src/lib/db/schema.ts` — Drizzle mirror (TypeScript types).
 - `src/lib/jobs/` — queue/state machine/retry/backoff.
@@ -51,8 +51,8 @@ npm run build        # production build (type-checked)
 npm run typecheck    # tsc --noEmit
 npm run worker       # background worker (node --conditions=react-server --import tsx)
 npm run test:logic   # 59 pure-logic checks (state machine, backoff, cron, …)
-npm run test:db      # 44 checks against a REAL throwaway PostgreSQL
-                     #   (applies every migration; verifies RLS + queue)
+npm run test:db      # checks against a REAL throwaway PostgreSQL
+                     #   (migrations, routes, RLS, runtime, queue, approvals)
 ```
 
 ## Environment
@@ -71,3 +71,5 @@ Phase 1–4 AI OS code complete and tested (logic + real-DB suites);
 hybrid integration with the Business OS complete. Production rollout is
 gated behind the safe-rollout plan — see `docs/safe-rollout.md` (migrations
 are applied manually in Supabase; nothing auto-deploys to production).
+
+See [Autonomous runtime: implementation and rollout](docs/autonomous-runtime.md) for current capabilities, connector opt-in, security boundaries, and staging gates.

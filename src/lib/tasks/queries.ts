@@ -9,52 +9,16 @@ import { withTimeout } from '@/lib/db/with-timeout';
  * Load all tasks for a workspace (used by chat sidebar/history)
  */
 export async function getWorkspaceTasks(workspaceId: string) {
-  try {
-    return await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.workspaceId, workspaceId))
-      .orderBy(desc(tasks.createdAt))
-      .limit(50); // Recent tasks only
-  } catch (err) {
-    console.error('Failed to fetch workspace tasks:', err);
-    return [];
-  }
+  return db.select().from(tasks).where(eq(tasks.workspaceId, workspaceId))
+    .orderBy(desc(tasks.createdAt)).limit(50);
 }
 
-/**
- * Load a specific task with its messages
- */
-export async function getTaskWithMessages(taskId: string) {
-  try {
-    const taskRows = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1);
-
-    // Narrow on the extracted element itself, not taskRows.length — same
-    // pattern as the createTask and orchestrator fixes. A .length check
-    // alone doesn't narrow taskRows[0] under noUncheckedIndexedAccess.
-    const task = taskRows[0];
-    if (!task) {
-      return null;
-    }
-
-    const taskMessages = await db
-      .select()
-      .from(messages)
-      .where(eq(messages.taskId, taskId))
-      .orderBy(messages.createdAt);
-
-    return {
-      task,
-      messages: taskMessages,
-    };
-  } catch (err) {
-    console.error('Failed to fetch task with messages:', err);
-    return null;
-  }
+/** Load task content only within an authorized workspace. */
+export async function getTaskWithMessages(taskId: string, workspaceId: string) {
+  const [task] = await db.select().from(tasks)
+    .where(and(eq(tasks.id, taskId), eq(tasks.workspaceId, workspaceId))).limit(1);
+  if (!task) return null;
+  return { task, messages: await getTaskMessages(taskId) };
 }
 
 /**
@@ -72,16 +36,11 @@ export async function getTaskWithMessages(taskId: string) {
  * slack for a legitimately slow-but-working query, not a tight cutoff.
  */
 export async function getTaskMessages(taskId: string) {
-  try {
-    return await withTimeout(
-      db.select().from(messages).where(eq(messages.taskId, taskId)).orderBy(messages.createdAt),
-      6_000,
-      'getTaskMessages'
-    );
-  } catch (err) {
-    console.error('Failed to fetch task messages:', err);
-    return [];
-  }
+  return withTimeout(
+    db.select().from(messages).where(eq(messages.taskId, taskId)).orderBy(messages.createdAt, messages.id),
+    6_000,
+    'getTaskMessages'
+  );
 }
 
 /**
@@ -131,7 +90,7 @@ export async function saveAgentMessages(taskId: string, agentMessages: AiMessage
 /**
  * Create a new task (called when user starts new conversation)
  */
-export async function createTask(workspaceId: string, userId: string, title: string) {
+export async function createTask(workspaceId: string, userId: string, title: string, projectId?: string | null) {
   try {
     const [newTask] = await withTimeout(
       db
@@ -140,6 +99,7 @@ export async function createTask(workspaceId: string, userId: string, title: str
           workspaceId,
           userId,
           title,
+          projectId,
           status: 'running',
         })
         .returning(),

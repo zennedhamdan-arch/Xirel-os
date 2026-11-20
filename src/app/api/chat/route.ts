@@ -1,6 +1,8 @@
+import { getExecutionPaused } from '@/lib/jobs/queue';
+import { rateLimit } from '@/lib/security/rate-limit';
+import { requireTaskAccess, requireWorkspaceAccess } from '@/lib/api/guards';
 import { NextResponse, type NextRequest } from 'next/server';
 import { z } from 'zod';
-import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
 import { messages } from '@/lib/db/schema';
 import { routeStreamText } from '@/lib/ai/router';
@@ -42,19 +44,10 @@ const chatRequestSchema = z.object({
   taskId: z.string().uuid().optional().nullable(),
   message: z.string().min(1, 'Message cannot be empty').max(10000),
   workspaceId: z.string().uuid(),
-  providerPriority: z.array(z.string()).optional(),
+  providerPriority: z.array(z.string().max(40)).max(7).optional(),
 });
 
 export async function POST(request: NextRequest) {
-  const supabase = createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
   let body: unknown;
   try {
     body = await request.json();
@@ -71,13 +64,20 @@ export async function POST(request: NextRequest) {
   }
 
   const { taskId, message, workspaceId, providerPriority } = parsed.data;
+  const access = taskId
+    ? await requireTaskAccess(taskId, { workspaceId, write: true })
+    : await requireWorkspaceAccess(workspaceId, 'member');
+  if (!access.ok) return access.response;
+  const { userId, workspaceId: authorizedWorkspaceId } = access.ctx;
+  if (await getExecutionPaused()) return NextResponse.json({ error: 'New agent execution is paused' }, { status: 503 });
+  if (!rateLimit(`chat:${userId}`, 20, 60_000).ok) return NextResponse.json({ error: 'Too many chat requests' }, { status: 429 });
 
   let currentTaskId = taskId;
 
   // Create or reuse task
   if (!currentTaskId) {
     try {
-      const newTask = await createTask(workspaceId, user.id, message.slice(0, 100));
+      const newTask = await createTask(authorizedWorkspaceId, userId, message.slice(0, 100));
       currentTaskId = newTask.id;
     } catch (err) {
       console.error('Failed to create task:', err);
@@ -192,7 +192,7 @@ export async function POST(request: NextRequest) {
     firstChunk = first.value;
   } catch (err) {
     console.error('Stream error:', err);
-    const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+    const errorMessage = 'AI streaming request failed';
     try {
       await updateTaskStatus(currentTaskId, 'failed');
     } catch {
@@ -246,7 +246,7 @@ export async function POST(request: NextRequest) {
         // change, so report the failure as a terminal SSE event the client
         // surfaces visibly.
         console.error('Stream error:', err);
-        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+        const errorMessage = 'AI streaming request failed';
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify({ error: errorMessage })}\n\n`)
         );

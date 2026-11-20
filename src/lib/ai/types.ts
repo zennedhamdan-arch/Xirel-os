@@ -45,6 +45,7 @@ export interface AiToolCall {
 }
 
 export interface AiRequest {
+  signal?: AbortSignal;
   messages: AiMessage[];
   /** Provider-specific model id, e.g. "gemini-2.0-flash". Resolved by the router. */
   model: string;

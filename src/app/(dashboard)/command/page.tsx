@@ -2,8 +2,9 @@ import { redirect } from 'next/navigation';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
 import { workspaceMembers } from '@/lib/db/schema';
-import { eq } from 'drizzle-orm';
-import { isPhase2SetupComplete } from '@/lib/db/setup-check';
+import { and, eq } from 'drizzle-orm';
+import { isCommandSetupComplete } from '@/lib/db/setup-check';
+import { isUuid } from '@/lib/api/guards';
 import CommandClient from './command-client';
 
 /**
@@ -26,19 +27,16 @@ export default async function CommandPage({
     redirect('/login');
   }
 
-  const isSetupComplete = await isPhase2SetupComplete();
+  const isSetupComplete = await isCommandSetupComplete();
 
-  let workspaceId = searchParams.workspace;
-  if (!workspaceId) {
-    const membership = await db.query.workspaceMembers.findFirst({
-      where: eq(workspaceMembers.userId, user.id),
-      columns: { workspaceId: true },
-    });
-    if (!membership) {
-      redirect('/onboarding');
-    }
-    workspaceId = membership.workspaceId;
-  }
+  const requested = searchParams.workspace;
+  if (requested && !isUuid(requested)) redirect('/command');
+  const membership = await db.query.workspaceMembers.findFirst({
+    where: and(eq(workspaceMembers.userId, user.id), requested ? eq(workspaceMembers.workspaceId, requested) : undefined),
+    columns: { workspaceId: true },
+  });
+  if (!membership) redirect(requested ? '/command' : '/onboarding');
+  const workspaceId = membership.workspaceId;
 
   if (!isSetupComplete) {
     return (
@@ -50,7 +48,7 @@ export default async function CommandPage({
               The command center needs the database migrations applied first
               (in order): <code>0001</code>–<code>0006</code>, then{' '}
               <code>0007_rls_recursion_fix.sql</code> and{' '}
-              <code>0008_durable_execution.sql</code> from{' '}
+              <code>0008</code>–<code>0011</code> from{' '}
               <code>supabase/migrations/</code>.
             </p>
           </div>
@@ -59,5 +57,5 @@ export default async function CommandPage({
     );
   }
 
-  return <CommandClient workspaceId={workspaceId} />;
+  return <CommandClient key={workspaceId} workspaceId={workspaceId} />;
 }

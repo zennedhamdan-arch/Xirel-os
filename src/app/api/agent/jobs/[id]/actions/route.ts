@@ -1,13 +1,13 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
-import { requireWorkspaceAccess } from '@/lib/api/guards';
+import { canManageOwnedResource, isUuid, requireUser, requireWorkspaceAccess } from '@/lib/api/guards';
 import { rateLimit } from '@/lib/security/rate-limit';
-import { cancelJob, pauseJob, resumeJob, getJob } from '@/lib/jobs/queue';
+import { cancelJob, pauseJob, resumeJob, getJob, submitJob } from '@/lib/jobs/queue';
 
 export const dynamic = 'force-dynamic';
 
 const actionSchema = z.object({
-  action: z.enum(['cancel', 'pause', 'resume']),
+  action: z.enum(['cancel', 'pause', 'resume', 'retry']),
 });
 
 /**
@@ -20,6 +20,9 @@ export async function POST(
   request: Request,
   { params }: { params: { id: string } },
 ) {
+  const session = await requireUser();
+  if (!session.ok) return session.response;
+  if (!isUuid(params.id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   let body: unknown;
   try {
     body = await request.json();
@@ -34,16 +37,25 @@ export async function POST(
   const job = await getJob(params.id);
   if (!job) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  // requester OR admin+ may act on a job (mirrors the RLS update policy)
-  const isRequester = job.createdBy === (await currentUserId());
-  const guard = await requireWorkspaceAccess(job.workspaceId, isRequester ? 'viewer' : 'admin');
-  if (!guard.ok) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  const guard = await requireWorkspaceAccess(job.workspaceId, 'member');
+  if (!guard.ok || !canManageOwnedResource(guard.ctx, job.createdBy)) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
 
   const rl = rateLimit(`jobs:action:${guard.ctx.userId}`, 30, 60_000);
   if (!rl.ok) {
     return NextResponse.json({ error: 'Too many actions' }, { status: 429 });
   }
 
+  if (parsed.data.action === 'retry') {
+    if (job.status !== 'failed' || job.checkpoint?.writeAttempt != null) {
+      return NextResponse.json({ error: 'Only failed jobs without interrupted writes can be retried' }, { status: 409 });
+    }
+    const { job: replacement } = await submitJob({ workspaceId: job.workspaceId, createdBy: guard.ctx.userId,
+      title: job.title, description: job.description, projectId: job.projectId, taskType: job.taskType,
+      idempotencyKey: `retry:${job.id}` });
+    return NextResponse.json({ ok: true, jobId: replacement.id }, { status: 202 });
+  }
   let ok: boolean;
   switch (parsed.data.action) {
     case 'cancel':
@@ -64,13 +76,4 @@ export async function POST(
     );
   }
   return NextResponse.json({ ok: true, action: parsed.data.action });
-}
-
-async function currentUserId(): Promise<string | null> {
-  const { createSupabaseServerClient } = await import('@/lib/auth/supabase-server');
-  const supabase = createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  return user?.id ?? null;
 }

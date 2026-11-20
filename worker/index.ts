@@ -14,6 +14,7 @@
  * Concurrency is bounded by WORKER_CONCURRENCY (default 2).
  */
 
+import { randomUUID } from 'node:crypto';
 import { claimDueJobs, heartbeatWorker, renewLease, getExecutionPaused, failAbandonedExhaustedJobs } from '@/lib/jobs/queue';
 import { fireDueSchedules } from '@/lib/schedules/scan';
 import { executeJob } from './job-executor';
@@ -50,7 +51,7 @@ function providerPriority(): AiProviderId[] {
   return parsed.length > 0 ? parsed : DEFAULT_PROVIDERS;
 }
 
-const active = new Map<string, Promise<void>>();
+const active = new Map<string, { owner: string; controller: AbortController }>();
 let shuttingDown = false;
 let schedulerTimer: NodeJS.Timeout | null = null;
 
@@ -60,7 +61,7 @@ function log(...args: unknown[]): void {
 
 async function runSchedulerTick(): Promise<void> {
   try {
-    const fired = await fireDueSchedules(10);
+    const fired = await getExecutionPaused() ? [] : await fireDueSchedules(10);
     for (const f of fired) {
       log(`schedule ${f.scheduleId} → job ${f.jobId ?? 'FAILED'}${f.error ? ` (${f.error})` : ''}`);
     }
@@ -85,17 +86,21 @@ async function pump(): Promise<void> {
     const capacity = CONCURRENCY - active.size;
     if (capacity <= 0) return;
 
+    const owner = `${WORKER_ID}:${randomUUID()}`;
     const jobs = await claimDueJobs({
-      workerId: WORKER_ID,
+      workerId: owner,
+      excludeJobIds: [...active.keys()],
       leaseSeconds: LEASE_SECONDS,
       limit: capacity,
     });
 
     for (const job of jobs) {
       log(`claimed job ${job.id} (attempt ${job.attemptCount}/${job.maxAttempts}) — ${job.title}`);
-      const execution = executeJob(job, {
-        workerId: WORKER_ID,
-        leaseSeconds: LEASE_SECONDS,
+      const controller = new AbortController();
+      active.set(job.id, { owner, controller });
+      void executeJob(job, {
+        workerId: owner,
+        signal: controller.signal,
         providerPriority: providerPriority(),
       })
         .then((result) => {
@@ -107,7 +112,6 @@ async function pump(): Promise<void> {
         .finally(() => {
           active.delete(job.id);
         });
-      active.set(job.id, execution);
     }
   } catch (error) {
     log('claim loop failed (will retry):', error instanceof Error ? error.message : error);
@@ -116,10 +120,11 @@ async function pump(): Promise<void> {
 
 async function heartbeatLoop(): Promise<void> {
   // renew leases for every active job + report the worker heartbeat
-  for (const jobId of Array.from(active.keys())) {
+  for (const [jobId, execution] of active) {
     try {
-      const renewed = await renewLease(jobId, WORKER_ID, LEASE_SECONDS);
+      const renewed = await renewLease(jobId, execution.owner, LEASE_SECONDS);
       if (!renewed && !shuttingDown) {
+        execution.controller.abort();
         log(`warning: lost lease on job ${jobId} — its executor result may be discarded`);
       }
     } catch {
@@ -150,18 +155,9 @@ async function drainAndExit(signal: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  // Release any job still active back to the queue: another worker (or
-  // this one after redeploy) picks it up immediately; the attempt is
-  // already counted, and its checkpoint limits repeated work.
-  for (const jobId of Array.from(active.keys())) {
-    try {
-      const { transitionJob } = await import('@/lib/jobs/queue');
-      const released = await transitionJob(jobId, WORKER_ID, 'queued');
-      log(`released job ${jobId} on shutdown: ${released ? 'queued' : 'not owned (left to lease expiry)'}`);
-    } catch (error) {
-      log(`failed to release job ${jobId}:`, error instanceof Error ? error.message : error);
-    }
-  }
+  // Do not release a still-running write. Reclaim after lease expiry and
+  // honor the persisted write-attempt marker instead of replaying it.
+  for (const run of active.values()) run.controller.abort();
 
   try {
     await heartbeatWorker({

@@ -47,6 +47,7 @@ export async function GET(request: Request) {
         decidedAt: a.decidedAt,
         decisionNote: a.decisionNote,
         createdAt: a.createdAt,
+        args: ['admin', 'owner'].includes(guard.ctx.role) && a.payload.version === 1 ? a.payload.args : undefined,
       })),
     });
   } catch (err) {

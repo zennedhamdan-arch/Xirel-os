@@ -58,7 +58,7 @@ export const openrouterProvider: AiProvider = {
 
     const res = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
       method: 'POST',
-      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+      signal: AbortSignal.any([AbortSignal.timeout(PROVIDER_TIMEOUT_MS), ...(request.signal ? [request.signal] : [])]),
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',

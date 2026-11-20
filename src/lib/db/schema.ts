@@ -14,6 +14,7 @@
 
 import {
   pgTable,
+  type AnyPgColumn,
   uuid,
   text,
   timestamp,
@@ -212,6 +213,9 @@ export const tasks = pgTable('tasks', {
     .references(() => profiles.id, { onDelete: 'cascade' }),
   /** Nullable: tasks created before Phase 4 (or not project-scoped) have no project. */
   projectId: uuid('project_id').references(() => projects.id, { onDelete: 'set null' }),
+  parentTaskId: uuid('parent_task_id').references((): AnyPgColumn => tasks.id, { onDelete: 'set null' }),
+  blockedByTaskId: uuid('blocked_by_task_id').references((): AnyPgColumn => tasks.id, { onDelete: 'set null' }),
+  priority: integer('priority').notNull().default(0),
   title: text('title').notNull(),
   description: text('description'),
   status: taskStatusEnum('status').notNull().default('queued'),
@@ -620,6 +624,7 @@ export const agentApprovals = pgTable(
     decidedBy: uuid('decided_by').references(() => profiles.id, { onDelete: 'set null' }),
     decisionNote: text('decision_note'),
     decidedAt: timestamp('decided_at', { withTimezone: true }),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },

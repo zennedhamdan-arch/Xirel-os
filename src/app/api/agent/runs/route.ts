@@ -1,3 +1,4 @@
+import { requireWorkspaceAccess } from '@/lib/api/guards';
 import { NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
@@ -12,7 +13,13 @@ import { listRunsForWorkspaces } from '@/lib/agents/runs';
  * minimal read layer a future Agent Activity panel renders. Requires
  * auth; only runs from workspaces the user belongs to are returned.
  */
-export async function GET() {
+export async function GET(request: Request) {
+  const workspaceId = new URL(request.url).searchParams.get('workspaceId');
+  if (workspaceId) {
+    const access = await requireWorkspaceAccess(workspaceId);
+    if (!access.ok) return access.response;
+    return NextResponse.json({ runs: (await listRunsForWorkspaces([access.ctx.workspaceId])).map(publicRun) });
+  }
   const supabase = createSupabaseServerClient();
   const {
     data: { user },
@@ -29,9 +36,13 @@ export async function GET() {
       .where(eq(workspaceMembers.userId, user.id));
 
     const runs = await listRunsForWorkspaces(memberships.map((m) => m.workspaceId));
-    return NextResponse.json({ runs });
+    return NextResponse.json({ runs: runs.map(publicRun) });
   } catch (err) {
     console.error('Failed to list agent runs:', err);
     return NextResponse.json({ error: 'Failed to list agent runs' }, { status: 500 });
   }
+}
+
+function publicRun({ id, status, taskId, projectId, startedAt, currentStep }: Awaited<ReturnType<typeof listRunsForWorkspaces>>[number]) {
+  return { id, status, taskId, projectId, startedAt, currentStep };
 }

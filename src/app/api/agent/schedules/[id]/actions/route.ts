@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { eq } from 'drizzle-orm';
 import { db } from '@/lib/db';
 import { agentSchedules } from '@/lib/db/schema';
-import { requireWorkspaceAccess } from '@/lib/api/guards';
+import { canManageOwnedResource, isUuid, requireUser, requireWorkspaceAccess } from '@/lib/api/guards';
 import { rateLimit } from '@/lib/security/rate-limit';
 import { validateCron, nextCronRun } from '@/lib/schedules/cron';
 import { submitJob } from '@/lib/jobs/queue';
@@ -17,7 +17,6 @@ const actionsSchema = z.object({
   name: z.string().min(1).max(120).optional(),
 });
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * POST /api/agent/schedules/[id]/actions — enable/disable/pause/resume,
@@ -28,10 +27,9 @@ export async function POST(
   request: Request,
   { params }: { params: { id: string } },
 ) {
-  if (!UUID.test(params.id)) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  }
-
+  const session = await requireUser();
+  if (!session.ok) return session.response;
+  if (!isUuid(params.id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   let body: unknown;
   try {
     body = await request.json();
@@ -48,7 +46,9 @@ export async function POST(
   if (!schedule) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
   const guard = await requireWorkspaceAccess(schedule.workspaceId, 'member');
-  if (!guard.ok) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (!guard.ok || !canManageOwnedResource(guard.ctx, schedule.createdBy)) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
 
   const rl = rateLimit(`schedules:action:${guard.ctx.userId}`, 30, 60_000);
   if (!rl.ok) return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
@@ -108,7 +108,7 @@ export async function POST(
   } catch (err) {
     console.error('Schedule action failed:', err);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Schedule action failed' },
+      { error: 'Schedule action failed' },
       { status: 500 },
     );
   }

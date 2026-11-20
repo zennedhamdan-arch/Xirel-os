@@ -113,8 +113,10 @@ export interface JobCheckpoint {
   runId?: string;
   /** Project resolved/created during execution, if any. */
   projectId?: string;
-  /** Tools the human approved (waiting_for_approval resolution). */
-  approvedTools?: string[];
+  /** Reference to a server-side, exact single-use approval receipt. */
+  approvalId?: string;
+  /** A crashed attempt may have performed a write: never replay it automatically. */
+  writeAttempt?: number;
   /** Number of orchestrator tool steps already persisted. */
   completedSteps?: number;
   /** What the job was last doing (diagnostics + resume decisions). */

@@ -51,13 +51,12 @@ export interface OrchestratorRunRequest {
    * are logged, never raised into the loop.
    */
   hooks?: OrchestratorHooks;
-  /**
-   * Tools a human explicitly approved while the run waited for approval
-   * (durable queue: waiting_for_approval → approved → resume). An
-   * approved tool bypasses the approval gate ONCE per mention in this
-   * list — the gate still applies to everything else.
-   */
-  approvedTools?: string[];
+  signal?: AbortSignal;
+  allowedTool?: string;
+  checkActive?: () => Promise<void>;
+  beforeWrite?: () => Promise<void>;
+  consumeApproval?: (tool: string, args: Record<string, unknown>) => Promise<boolean>;
+
 }
 
 export interface OrchestratorHooks {
@@ -78,6 +77,7 @@ export interface OrchestratorRunResult {
   newMessages: AiMessage[];
   providerId: AiProviderId;
   iterations: number;
+  exhausted?: boolean;
 }
 
 async function getWorkspaceRole(
@@ -134,10 +134,10 @@ async function executeToolCall(
     userId: string;
     taskId: string;
     runId?: string | null;
-    approvedTools?: string[];
+    beforeWrite?: () => Promise<void>;
+    consumeApproval?: OrchestratorRunRequest['consumeApproval'];
   },
-  userRole: 'viewer' | 'member' | 'admin' | 'owner',
-  onFinished?: (call: AiToolCall, resultJson: string, success: boolean) => Promise<void> | void
+  userRole: 'viewer' | 'member' | 'admin' | 'owner'
 ): Promise<string> {
   const tool = getTool(call.name);
 
@@ -171,33 +171,6 @@ async function executeToolCall(
     return JSON.stringify({ success: false, error });
   }
 
-  // Approval gate (Phase 4): moderate+ risk tools enter waiting_for_approval
-  // semantics instead of executing unattended. All registered tools are
-  // safe/low today, so runtime behavior is unchanged — this is the central
-  // enforcement point future gateway tools must pass.
-  const approval = requiresApproval(tool.riskLevel);
-  const humanApproved =
-    approval.action === 'requires_approval' && (ctx.approvedTools ?? []).includes(tool.name);
-  if (approval.action === 'requires_approval' && !humanApproved) {
-    const error = `APPROVAL_REQUIRED: tool "${tool.name}" — ${approval.reason}`;
-    await logToolExecution({
-      taskId: ctx.taskId,
-      runId: ctx.runId ?? null,
-      toolName: tool.name,
-      riskLevel: tool.riskLevel,
-      input: call.arguments,
-      output: undefined,
-      success: false,
-      error,
-    });
-    return JSON.stringify({
-      success: false,
-      error,
-      approval_required: true,
-      riskLevel: tool.riskLevel,
-    });
-  }
-
   const parsed = tool.inputSchema.safeParse(call.arguments);
   if (!parsed.success) {
     const error = `Invalid arguments for tool "${tool.name}": ${parsed.error.message}`;
@@ -214,6 +187,11 @@ async function executeToolCall(
     return JSON.stringify({ success: false, error });
   }
 
+  const approval = requiresApproval(tool.riskLevel);
+  if (approval.action === 'requires_approval' && !(await ctx.consumeApproval?.(tool.name, call.arguments))) {
+    return JSON.stringify({ success: false, approval_required: true, riskLevel: tool.riskLevel });
+  }
+  if (tool.riskLevel !== 'safe') await ctx.beforeWrite?.();
   try {
     const result = await tool.execute(parsed.data, ctx);
     await logToolExecution({
@@ -222,24 +200,17 @@ async function executeToolCall(
       toolName: tool.name,
       riskLevel: tool.riskLevel,
       input: call.arguments,
-      output: result.output as Record<string, unknown> | undefined,
+      output: { recorded: true },
       success: result.success,
       error: result.error,
     });
-    if (onFinished) {
-      try {
-        await onFinished(call, JSON.stringify(result), result.success);
-      } catch (err) {
-        console.error('Orchestrator onToolExecuted hook failed:', err);
-      }
-    }
     return JSON.stringify(result);
   } catch (err) {
     // A tool's execute() throwing is a bug in the tool, not a reason to
     // crash the agent loop — surface it to the model as a failed result
     // so it can decide how to proceed (retry, try another approach, tell
     // the user), same as any other tool failure.
-    const error = err instanceof Error ? err.message : 'Tool execution threw an unexpected error';
+    const error = 'Tool execution failed';
     await logToolExecution({
       taskId: ctx.taskId,
       runId: ctx.runId ?? null,
@@ -258,7 +229,7 @@ export async function runOrchestrator(
   request: OrchestratorRunRequest
 ): Promise<OrchestratorRunResult> {
   const userRole = await getWorkspaceRole(request.workspaceId, request.userId);
-  if (!userRole) {
+  if (!userRole || userRole === 'viewer') {
     throw new Error('Caller is not a member of this workspace — cannot run agent.');
   }
 
@@ -273,7 +244,7 @@ export async function runOrchestrator(
     throw new Error('runOrchestrator: providerPriority was empty — no provider to route to.');
   }
 
-  const availableTools = getAllTools().filter((t) => hasPermission(userRole, t.requiredPermission));
+  const availableTools = getAllTools(request.workspaceId).filter((t) => hasPermission(userRole, t.requiredPermission) && (!request.allowedTool || request.allowedTool === t.name));
   const aiTools = toAiToolDefinitions(availableTools);
 
   const conversation: AiMessage[] = [...request.messages];
@@ -289,7 +260,10 @@ export async function runOrchestrator(
         console.error('Orchestrator onTurnStart hook failed:', err);
       }
     }
+    request.signal?.throwIfAborted();
+    await request.checkActive?.();
     const routeRequest: RouteRequest = {
+      signal: request.signal,
       messages: conversation,
       // `model` is required by AiRequest but is only actually used when a
       // provider has no modelByProvider entry — every provider we route to
@@ -337,30 +311,27 @@ export async function runOrchestrator(
     conversation.push(assistantToolCallMessage);
     newMessages.push(assistantToolCallMessage);
 
-    for (const call of response.toolCalls) {
-      const resultJson = await executeToolCall(
-        call,
-        {
-          workspaceId: request.workspaceId,
-          userId: request.userId,
-          taskId: request.taskId,
-          runId: hooks?.runId ?? null,
-          approvedTools: request.approvedTools,
-        },
-        userRole,
-        hooks?.onToolExecuted
-          ? (c, json, success) => hooks.onToolExecuted!(c, json, success)
-          : undefined
-      );
-      const toolResultMessage: AiMessage = {
-        role: 'tool',
-        content: resultJson,
-        toolCallId: call.id,
-        name: call.name,
-      };
+    for (const call of response.toolCalls.slice(0, 8)) {
+      request.signal?.throwIfAborted();
+      await request.checkActive?.();
+      const currentRole = await getWorkspaceRole(request.workspaceId, request.userId);
+      if (!currentRole || currentRole === 'viewer') throw new Error('Workspace execution permission was revoked');
+      const resultJson = availableTools.some(t => t.name === call.name)
+        ? await executeToolCall(call, { workspaceId: request.workspaceId, userId: request.userId,
+          taskId: request.taskId, runId: hooks?.runId, beforeWrite: request.beforeWrite,
+          consumeApproval: request.consumeApproval }, currentRole)
+        : JSON.stringify({ success: false, error: 'Tool is not available for this step' });
+      const result = JSON.parse(resultJson) as { success?: boolean; approval_required?: boolean };
+      await hooks?.onToolExecuted?.(call, resultJson, result.success === true);
+      if (result.approval_required || !result.success) {
+        return { text: result.approval_required ? 'Waiting for approval.' : 'A tool failed.', newMessages,
+          providerId: response.providerId, iterations: iteration + 1 };
+      }
+      const toolResultMessage: AiMessage = { role: 'tool', content: resultJson, toolCallId: call.id, name: call.name };
       conversation.push(toolResultMessage);
       newMessages.push(toolResultMessage);
     }
+    if (response.toolCalls.length > 8) throw new Error('Too many tool calls in one model response');
   }
 
   // Hit the iteration cap without a final answer — surface this honestly
@@ -383,5 +354,6 @@ export async function runOrchestrator(
     newMessages,
     providerId: lastProviderId,
     iterations: MAX_ITERATIONS,
+    exhausted: true,
   };
 }

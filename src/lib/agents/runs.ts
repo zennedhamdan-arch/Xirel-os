@@ -87,7 +87,7 @@ export async function updateRunStatus(
       'updateRunStatus'
     );
   } catch (err) {
-    console.error(`Failed to update run ${runId} status to ${status}:`, err);
+    throw new Error(`Could not persist run status: ${status}`, { cause: err });
   }
 }
 
@@ -143,6 +143,7 @@ export interface StartStepInput {
   runId: string;
   sequence: number;
   stepType: string;
+  pending?: boolean;
   description: string;
   input?: Record<string, unknown> | null;
   toolName?: string | null;
@@ -158,10 +159,10 @@ export async function startStep(input: StartStepInput): Promise<AgentStepRecord 
           sequence: input.sequence,
           stepType: input.stepType,
           description: input.description,
-          status: 'running',
+          status: input.pending ? 'pending' : 'running',
           input: input.input ?? null,
           toolName: input.toolName ?? null,
-          startedAt: new Date(),
+          startedAt: input.pending ? null : new Date(),
         })
         .returning(),
       WRITE_TIMEOUT_MS,
@@ -197,8 +198,14 @@ export async function finishStep(
       'finishStep'
     );
   } catch (err) {
-    console.error('Failed to persist agent step finish:', err);
+    throw new Error('Could not persist plan step outcome', { cause: err });
   }
+}
+
+export async function beginPlanStep(id: string) {
+  const [row] = await db.update(agentSteps).set({ status: 'running', startedAt: new Date() })
+    .where(and(eq(agentSteps.id, id), eq(agentSteps.status, 'pending'))).returning({ id: agentSteps.id });
+  if (!row) throw new Error('Could not begin plan step');
 }
 
 export async function listSteps(runId: string): Promise<AgentStepRecord[]> {

@@ -19,7 +19,7 @@ import {
   agentApprovals,
   agentJobs,
   systemSettings,
-  workerHeartbeats,
+  workerHeartbeats, tasks,
   type agentJobStatusEnum,
 } from '@/lib/db/schema';
 import {
@@ -62,11 +62,13 @@ export interface SubmitJobResult {
  * submissions (double-click, webhook redelivery, scheduler double-fire)
  * collapse into one job.
  */
-export async function submitJob(input: SubmitJobInput): Promise<SubmitJobResult> {
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+export async function submitJob(input: SubmitJobInput, client: typeof db | Transaction = db): Promise<SubmitJobResult> {
   const maxAttempts = Math.min(Math.max(input.maxAttempts ?? 3, 1), 10);
 
   if (input.idempotencyKey) {
-    const inserted = await db
+    const inserted = await client
       .insert(agentJobs)
       .values({
         workspaceId: input.workspaceId,
@@ -88,7 +90,7 @@ export async function submitJob(input: SubmitJobInput): Promise<SubmitJobResult>
     const row = inserted[0];
     if (row) return { job: row, created: true };
 
-    const existing = await db
+    const existing = await client
       .select()
       .from(agentJobs)
       .where(
@@ -103,7 +105,7 @@ export async function submitJob(input: SubmitJobInput): Promise<SubmitJobResult>
     throw new Error('submitJob: idempotent insert neither inserted nor found a row');
   }
 
-  const inserted = await db
+  const inserted = await client
     .insert(agentJobs)
     .values({
       workspaceId: input.workspaceId,
@@ -130,6 +132,7 @@ export interface ClaimOptions {
   leaseSeconds?: number;
   /** Max jobs to claim this tick. Default 1. */
   limit?: number;
+  excludeJobIds?: string[];
 }
 
 /**
@@ -153,6 +156,7 @@ export async function claimDueJobs(options: ClaimOptions): Promise<JobRow[]> {
           and lease_expires_at is not null and lease_expires_at <= now())
       )
       and attempt_count < max_attempts
+      and not (id = any(${`{${(options.excludeJobIds ?? []).join(',')}}`}::uuid[]))
       order by priority desc, next_execution_at asc
       limit ${limit}
       for update skip locked
@@ -241,7 +245,7 @@ export async function transitionJob(
   const updated = await db
     .update(agentJobs)
     .set(sets)
-    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId)))
+    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId), sql`${agentJobs.leaseExpiresAt} > now()`))
     .returning();
   return updated.length > 0;
 }
@@ -259,6 +263,7 @@ export async function renewLease(
         updated_at = now()
     where id = ${jobId}
       and lease_owner = ${workerId}
+      and lease_expires_at > now()
       and status not in ('completed', 'failed', 'cancelled')
   `);
   return Number((result as unknown as { count?: number }).count ?? 0) > 0;
@@ -306,6 +311,14 @@ export async function finishJob(
   workerId: string,
   outcome: JobOutcome,
 ): Promise<'completed' | 'failed' | 'retrying' | 'not_owner'> {
+  const persistTerminal = (sets: Record<string, unknown>, status: 'completed' | 'failed') =>
+    db.transaction(async tx => {
+      const [changed] = await tx.update(agentJobs).set(sets)
+        .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId), sql`${agentJobs.leaseExpiresAt} > now()`)).returning();
+      if (changed?.taskId) await tx.update(tasks).set({ status, updatedAt: new Date() }).where(and(
+        eq(tasks.id, changed.taskId), eq(tasks.workspaceId, changed.workspaceId), eq(tasks.userId, changed.createdBy)));
+      return !!changed;
+    });
   const current = await getJob(jobId);
   if (!current || current.leaseOwner !== workerId) return 'not_owner';
 
@@ -322,17 +335,12 @@ export async function finishJob(
     };
     if (outcome.checkpoint)
       sets.checkpoint = mergeCheckpoint(current.checkpoint, outcome.checkpoint) as Record<string, unknown>;
-    const updated = await db
-      .update(agentJobs)
-      .set(sets)
-      .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId)))
-      .returning();
-    return updated.length > 0 ? 'completed' : 'not_owner';
+    return (await persistTerminal(sets, 'completed')) ? 'completed' : 'not_owner';
   }
 
   const classified = outcome.error;
   const attemptsLeft = current.attemptCount < current.maxAttempts;
-  const mayRetry = classified.failureClass === 'transient' && attemptsLeft;
+  const mayRetry = classified.failureClass === 'transient' && attemptsLeft && current.checkpoint?.writeAttempt == null;
 
   if (mayRetry) {
     const nextAt = nextRetryAt(current.attemptCount, new Date(), {
@@ -352,7 +360,7 @@ export async function finishJob(
     const updated = await db
       .update(agentJobs)
       .set(sets)
-      .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId)))
+      .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId), sql`${agentJobs.leaseExpiresAt} > now()`))
       .returning();
     return updated.length > 0 ? 'retrying' : 'not_owner';
   }
@@ -369,12 +377,7 @@ export async function finishJob(
   };
   if (outcome.checkpoint)
     sets.checkpoint = mergeCheckpoint(current.checkpoint, outcome.checkpoint) as Record<string, unknown>;
-  const updated = await db
-    .update(agentJobs)
-    .set(sets)
-    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId)))
-    .returning();
-  return updated.length > 0 ? 'failed' : 'not_owner';
+  return (await persistTerminal(sets, 'failed')) ? 'failed' : 'not_owner';
 }
 
 /**
@@ -383,150 +386,140 @@ export async function finishJob(
  * through decideApproval().
  */
 export async function waitForApproval(params: {
-  jobId: string;
-  workerId: string;
-  summary: string;
-  toolName?: string | null;
-  riskLevel?: string | null;
-  payload?: Record<string, unknown>;
-  runId?: string | null;
+  jobId: string; workerId: string; runId: string; summary: string;
+  toolName: string; riskLevel: string; args: Record<string, unknown>;
 }): Promise<{ approvalId: string } | null> {
-  const current = await getJob(params.jobId);
-  if (!current || current.leaseOwner !== params.workerId) return null;
-  if (!canTransition(current.status as JobStatus, 'waiting_for_approval')) return null;
-
-  const inserted = await db
-    .insert(agentApprovals)
-    .values({
-      workspaceId: current.workspaceId,
-      jobId: current.id,
-      runId: params.runId ?? current.runId ?? null,
-      requestedBy: current.createdBy,
-      toolName: params.toolName ?? null,
-      riskLevel: params.riskLevel ?? null,
-      summary: params.summary,
-      payload: params.payload ?? {},
-    })
-    .returning();
-  const approval = inserted[0];
-  if (!approval) return null;
-
-  const updated = await db
-    .update(agentJobs)
-    .set({
-      status: 'waiting_for_approval',
-      currentStep: 'waiting_for_approval',
-      lastError: null,
-      leaseOwner: null,
-      leaseExpiresAt: null,
-      updatedAt: new Date(),
-      checkpoint: mergeCheckpoint(current.checkpoint, {
-        lastStep: 'waiting_for_approval',
-        notes: params.summary.slice(0, 500),
-      }) as Record<string, unknown>,
-    })
-    .where(and(eq(agentJobs.id, params.jobId), eq(agentJobs.status, 'running')))
-    .returning();
-  if (updated.length === 0) return null;
-  return { approvalId: approval.id };
+  return db.transaction(async tx => {
+    const [job] = await tx.update(agentJobs).set({ status: 'waiting_for_approval',
+      currentStep: 'waiting_for_approval', leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() })
+      .where(and(eq(agentJobs.id, params.jobId), eq(agentJobs.status, 'running'),
+        eq(agentJobs.leaseOwner, params.workerId), sql`${agentJobs.leaseExpiresAt} > now()`)).returning();
+    if (!job) return null;
+    const [approval] = await tx.insert(agentApprovals).values({ workspaceId: job.workspaceId,
+      jobId: job.id, runId: params.runId, requestedBy: job.createdBy, toolName: params.toolName,
+      riskLevel: params.riskLevel, summary: params.summary, payload: { version: 1, args: params.args } }).returning({ id: agentApprovals.id });
+    if (!approval) throw new Error('Approval insert did not return an id');
+    return { approvalId: approval.id };
+  });
 }
 
 export type ApprovalDecision = 'approved' | 'rejected';
 
-/**
- * Resolve a pending approval (API-side, human decision).
- * approve → job returns to the queue with the tool recorded as granted
- * in the checkpoint; reject → job is cancelled. Lease-guarded states
- * keep this safe even if a worker concurrently died mid-approval.
- */
+/** Lock the job before the receipt (same lock order as consumption and cancellation). */
 export async function decideApproval(params: {
-  approvalId: string;
-  decidedBy: string;
-  decision: ApprovalDecision;
-  note?: string;
-}): Promise<'decided' | 'already_decided' | 'not_found'> {
-  const rows = await db
-    .select()
-    .from(agentApprovals)
-    .where(eq(agentApprovals.id, params.approvalId))
-    .limit(1);
-  const approval = rows[0];
-  if (!approval) return 'not_found';
-  if (approval.status !== 'pending') return 'already_decided';
+  approvalId: string; workspaceId: string; decidedBy: string; decision: ApprovalDecision; note?: string;
+}): Promise<'decided' | 'already_decided' | 'not_found' | 'stale'> {
+  return db.transaction(async tx => {
+    const [receipt] = await tx.select().from(agentApprovals).where(and(eq(agentApprovals.id, params.approvalId),
+      eq(agentApprovals.workspaceId, params.workspaceId))).limit(1);
+    if (!receipt?.jobId) return 'not_found';
+    if (receipt.status !== 'pending') return 'already_decided';
+    const [job] = await tx.select().from(agentJobs).where(and(eq(agentJobs.id, receipt.jobId),
+      eq(agentJobs.workspaceId, receipt.workspaceId))).for('update');
+    if (!job || job.status !== 'waiting_for_approval' || job.createdBy !== receipt.requestedBy) return 'stale';
+    if (params.decision === 'approved' && (receipt.payload.version !== 1 || !receipt.toolName || !receipt.payload.args
+      || job.checkpoint?.writeAttempt != null || Date.now() - receipt.createdAt.getTime() > 60 * 60_000)) return 'stale';
+    const now = new Date();
+    const [decision] = await tx.update(agentApprovals).set({ status: params.decision, decidedBy: params.decidedBy,
+      decidedAt: now, updatedAt: now, decisionNote: params.note ?? null })
+      .where(and(eq(agentApprovals.id, receipt.id), eq(agentApprovals.status, 'pending'))).returning({ id: agentApprovals.id });
+    if (!decision) return 'already_decided';
+    await tx.update(agentJobs).set(params.decision === 'approved' ? {
+      status: 'queued', currentStep: 'approval_granted', updatedAt: now, nextExecutionAt: now,
+      // The human decision is not itself a failed attempt.
+      attemptCount: Math.max(0, job.attemptCount - 1),
+      checkpoint: { ...job.checkpoint, approvalId: receipt.id },
+    } : { status: 'cancelled', currentStep: 'cancelled_by_rejection', updatedAt: now, completedAt: now })
+      .where(eq(agentJobs.id, job.id));
+    return 'decided';
+  });
+}
 
-  const now = new Date();
-  const updated = await db
-    .update(agentApprovals)
-    .set({
-      status: params.decision,
-      decidedBy: params.decidedBy,
-      decisionNote: params.note ?? null,
-      decidedAt: now,
-      updatedAt: now,
-    })
-    .where(and(eq(agentApprovals.id, params.approvalId), eq(agentApprovals.status, 'pending')))
-    .returning();
-  if (updated.length === 0) return 'already_decided';
+export async function readApprovalContinuation(job: JobRow, receiptId: string) {
+  const [receipt] = await db.select({ tool: agentApprovals.toolName, payload: agentApprovals.payload }).from(agentApprovals)
+    .where(and(eq(agentApprovals.id, receiptId), eq(agentApprovals.jobId, job.id), eq(agentApprovals.workspaceId, job.workspaceId),
+      eq(agentApprovals.requestedBy, job.createdBy), eq(agentApprovals.status, 'approved'),
+      sql`${agentApprovals.consumedAt} is null and ${agentApprovals.decidedAt} > now() - interval '1 hour'`));
+  return receipt?.payload.version === 1 ? { tool: receipt.tool, args: receipt.payload.args } : null;
+}
 
-  if (approval.jobId) {
-    const jobRows = await db.select().from(agentJobs).where(eq(agentJobs.id, approval.jobId)).limit(1);
-    const job = jobRows[0];
-    if (job && job.status === 'waiting_for_approval') {
-      if (params.decision === 'approved') {
-        await db
-          .update(agentJobs)
-          .set({
-            status: 'queued',
-            nextExecutionAt: now,
-            updatedAt: now,
-            checkpoint: mergeCheckpoint(job.checkpoint as JobCheckpoint, {
-              approvedTools: [
-                ...new Set([
-                  ...(((job.checkpoint as JobCheckpoint | null)?.approvedTools ?? [])),
-                  ...(approval.toolName ? [approval.toolName] : []),
-                ]),
-              ],
-              lastStep: 'approval_granted',
-              notes: params.note ?? undefined,
-            }) as Record<string, unknown>,
-          })
-          .where(eq(agentJobs.id, job.id));
-      } else {
-        await db
-          .update(agentJobs)
-          .set({
-            status: 'cancelled',
-            completedAt: now,
-            updatedAt: now,
-            currentStep: 'cancelled_by_rejection',
-            lastError: `Approval rejected${params.note ? `: ${params.note}` : ''}`,
-          })
-          .where(eq(agentJobs.id, job.id));
-      }
+/** Exact JSON arguments, pending job identity, fresh reviewer privileges and single use. */
+export async function consumeApproval(job: JobRow, workerId: string, receiptId: string, tool: string, args: Record<string, unknown>) {
+  return db.transaction(async tx => {
+    const owned = await tx.execute(sql`select id from agent_jobs where id = ${job.id}
+      and lease_owner = ${workerId} and lease_expires_at > now() and status = 'running' for update`);
+    if (!owned.length) return false;
+    const rows = await tx.execute(sql`update agent_approvals a set consumed_at = now(), updated_at = now()
+      where a.id = ${receiptId} and a.job_id = ${job.id} and a.workspace_id = ${job.workspaceId}
+        and a.requested_by = ${job.createdBy} and a.tool_name = ${tool} and a.status = 'approved'
+        and a.consumed_at is null and a.decided_at > now() - interval '1 hour'
+        and a.payload->>'version' = '1' and a.payload->'args' = ${JSON.stringify(args)}::jsonb
+        and exists (select 1 from workspace_members m where m.workspace_id = a.workspace_id
+          and m.user_id = a.decided_by and m.role in ('admin','owner')) returning a.id`);
+    return rows.length === 1;
+  });
+}
+
+export async function markWriteStarted(jobId: string, workerId: string) {
+  const rows = await db.execute(sql`update agent_jobs set checkpoint = checkpoint || jsonb_build_object('writeAttempt', attempt_count)
+    where id = ${jobId} and status = 'running' and lease_owner = ${workerId} and lease_expires_at > now()
+    and (checkpoint->>'writeAttempt' is null or checkpoint->>'writeAttempt' = attempt_count::text) returning id`);
+  if (!rows.length) throw new Error('Job lost lease or requires manual write recovery');
+}
+
+/** Lock the work item before enqueueing so concurrent submissions cannot duplicate an execution. */
+export async function enqueueProjectTask(workspaceId: string, taskId: string, userId: string) {
+  return db.transaction(async tx => {
+    const [task] = await tx.select().from(tasks).where(and(eq(tasks.id, taskId), eq(tasks.workspaceId, workspaceId),
+      eq(tasks.userId, userId))).for('update');
+    if (!task?.projectId) return null;
+    if (task.status !== 'queued') return false;
+    if (task.blockedByTaskId) {
+      const [dependency] = await tx.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.workspaceId, workspaceId),
+        eq(tasks.projectId, task.projectId), eq(tasks.id, task.blockedByTaskId), eq(tasks.status, 'completed')));
+      if (!dependency) return false;
     }
-  }
-  return 'decided';
+    const result = await submitJob({ workspaceId, createdBy: userId, taskId: task.id, projectId: task.projectId,
+      title: task.title, description: task.description?.trim() || task.title, priority: task.priority,
+      idempotencyKey: `work-item:${task.id}` }, tx);
+    await tx.update(tasks).set({ status: 'planning', updatedAt: new Date() }).where(eq(tasks.id, task.id));
+    return result;
+  });
+}
+
+/** Attach the conversation anchor in the same transaction that creates it. */
+export async function attachJobTask(jobId: string, workerId: string): Promise<string> {
+  return db.transaction(async tx => {
+    const [job] = await tx.select().from(agentJobs).where(and(eq(agentJobs.id, jobId),
+      eq(agentJobs.leaseOwner, workerId), sql`${agentJobs.leaseExpiresAt} > now()`)).for('update');
+    if (!job) throw new Error('Job lease lost');
+    if (job.taskId) {
+      const [task] = await tx.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.id, job.taskId),
+        eq(tasks.workspaceId, job.workspaceId), eq(tasks.userId, job.createdBy)));
+      if (!task) throw new Error('Task not owned by job requester in this workspace');
+      await tx.update(tasks).set({ status: 'running', updatedAt: new Date() }).where(eq(tasks.id, task.id));
+      return task.id;
+    }
+    const [task] = await tx.insert(tasks).values({ workspaceId: job.workspaceId, userId: job.createdBy,
+      projectId: job.projectId, title: job.title, description: job.description.slice(0, 4000), status: 'running' }).returning({ id: tasks.id });
+    if (!task) throw new Error('Task insert failed');
+    await tx.update(agentJobs).set({ taskId: task.id }).where(eq(agentJobs.id, job.id));
+    return task.id;
+  });
 }
 
 /** User/admin cancellation from the API (workspace membership checked upstream). */
 export async function cancelJob(jobId: string): Promise<boolean> {
-  const rows = await db.select().from(agentJobs).where(eq(agentJobs.id, jobId)).limit(1);
-  const job = rows[0];
-  if (!job) return false;
-  if (!canTransition(job.status as JobStatus, 'cancelled')) return false;
-  const updated = await db
-    .update(agentJobs)
-    .set({
-      status: 'cancelled',
-      completedAt: new Date(),
-      updatedAt: new Date(),
-      leaseOwner: null,
-      leaseExpiresAt: null,
-      currentStep: 'cancelled',
-    })
-    .where(eq(agentJobs.id, jobId))
-    .returning();
-  return updated.length > 0;
+  return db.transaction(async tx => {
+    const [job] = await tx.select().from(agentJobs).where(eq(agentJobs.id, jobId)).for('update');
+    if (!job || !canTransition(job.status as JobStatus, 'cancelled')) return false;
+    const now = new Date();
+    await tx.update(agentJobs).set({ status: 'cancelled', completedAt: now, updatedAt: now,
+      leaseOwner: null, leaseExpiresAt: null, currentStep: 'cancelled' }).where(eq(agentJobs.id, jobId));
+    if (job.taskId) await tx.update(tasks).set({ status: 'cancelled', updatedAt: now }).where(and(
+      eq(tasks.id, job.taskId), eq(tasks.workspaceId, job.workspaceId), eq(tasks.userId, job.createdBy)));
+    return true;
+  });
 }
 
 export async function pauseJob(jobId: string): Promise<boolean> {
@@ -543,7 +536,7 @@ export async function pauseJob(jobId: string): Promise<boolean> {
       leaseExpiresAt: null,
       currentStep: 'paused',
     })
-    .where(eq(agentJobs.id, jobId))
+    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.status, job.status)))
     .returning();
   return updated.length > 0;
 }
@@ -561,7 +554,7 @@ export async function resumeJob(jobId: string): Promise<boolean> {
       updatedAt: new Date(),
       currentStep: null,
     })
-    .where(eq(agentJobs.id, jobId))
+    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.status, job.status)))
     .returning();
   return updated.length > 0;
 }
@@ -630,7 +623,7 @@ export async function attachRunToJob(
         ...(projectId ? { projectId } : {}),
       }) as Record<string, unknown>,
     })
-    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId)));
+    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.leaseOwner, workerId), sql`${agentJobs.leaseExpiresAt} > now()`));
 }
 
 // ─────────────────────────────────────────────────────────
@@ -688,11 +681,11 @@ export async function countJobsByStatus(
 }
 
 /** Used by observability: oldest pending (queued/retrying) job age. */
-export async function getOldestPendingJobAgeSeconds(): Promise<number | null> {
+export async function getOldestPendingJobAgeSeconds(workspaceId: string): Promise<number | null> {
   const result = await db.execute(sql`
     select extract(epoch from (now() - min(created_at)))::int as age
     from agent_jobs
-    where status in ('queued', 'retrying')
+    where workspace_id = ${workspaceId} and status in ('queued', 'retrying')
   `);
   const row = (result as unknown as Record<string, unknown>[])[0];
   const age = row?.age;

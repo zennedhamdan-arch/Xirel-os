@@ -192,18 +192,6 @@ export async function updateProject(
   return rows[0] ?? null;
 }
 
-/** Attaches a task to a project (task → project edge). Existing tasks unaffected. */
-export async function attachTaskToProject(
-  taskId: string,
-  projectId: string
-): Promise<void> {
-  await withTimeout(
-    db.update(tasks).set({ projectId, updatedAt: new Date() }).where(eq(tasks.id, taskId)),
-    QUERY_TIMEOUT_MS,
-    'attachTaskToProject'
-  );
-}
-
 /**
  * The context the agent gets when it resolves a project: the registry
  * row plus a brief roll-up (recent runs/tasks/memory) so "continue the
@@ -219,7 +207,7 @@ export async function getProjectSummary(workspaceId: string, projectId: string) 
       db
         .select()
         .from(projectMemory)
-        .where(eq(projectMemory.projectId, projectId))
+        .where(and(eq(projectMemory.projectId, projectId), eq(projectMemory.workspaceId, workspaceId)))
         .orderBy(desc(projectMemory.updatedAt))
         .limit(20),
       QUERY_TIMEOUT_MS,
@@ -227,11 +215,12 @@ export async function getProjectSummary(workspaceId: string, projectId: string) 
     ).catch(() => [] as ProjectMemoryRecord[]),
     withTimeout(
       db
-        .select({ id: tasks.id, title: tasks.title, status: tasks.status, updatedAt: tasks.updatedAt })
+        .select({ id: tasks.id, title: tasks.title, status: tasks.status, updatedAt: tasks.updatedAt,
+          priority: tasks.priority, parentTaskId: tasks.parentTaskId, blockedByTaskId: tasks.blockedByTaskId })
         .from(tasks)
-        .where(eq(tasks.projectId, projectId))
-        .orderBy(desc(tasks.updatedAt))
-        .limit(5),
+        .where(and(eq(tasks.projectId, projectId), eq(tasks.workspaceId, workspaceId)))
+        .orderBy(desc(tasks.priority), desc(tasks.updatedAt))
+        .limit(25),
       QUERY_TIMEOUT_MS,
       'projectSummaryTasks'
     ).catch(() => []),
@@ -255,6 +244,7 @@ export interface UpsertMemoryInput {
 
 /** Inserts or updates a memory entry keyed by (project, kind, key). */
 export async function upsertProjectMemory(input: UpsertMemoryInput): Promise<ProjectMemoryRecord> {
+  if (!(await getProject(input.workspaceId, input.projectId))) throw new Error('Project not found');
   const key = (input.key ?? '').trim();
   const content = input.content.trim();
   if (!content) {
@@ -289,36 +279,4 @@ export async function upsertProjectMemory(input: UpsertMemoryInput): Promise<Pro
     throw new Error('Project memory upsert returned no row');
   }
   return row;
-}
-
-export async function listProjectMemory(
-  projectId: string,
-  kind?: ProjectMemoryKind
-): Promise<ProjectMemoryRecord[]> {
-  const where = kind
-    ? and(eq(projectMemory.projectId, projectId), eq(projectMemory.kind, kind))
-    : eq(projectMemory.projectId, projectId);
-  return withTimeout(
-    db
-      .select()
-      .from(projectMemory)
-      .where(where)
-      .orderBy(desc(projectMemory.updatedAt))
-      .limit(100),
-    QUERY_TIMEOUT_MS,
-    'listProjectMemory'
-  );
-}
-
-/** Row count guard used by tests/health — never exposes content. */
-export async function countProjectMemory(projectId: string): Promise<number> {
-  const rows = await withTimeout(
-    db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(projectMemory)
-      .where(eq(projectMemory.projectId, projectId)),
-    QUERY_TIMEOUT_MS,
-    'countProjectMemory'
-  );
-  return rows[0]?.count ?? 0;
 }

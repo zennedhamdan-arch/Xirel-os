@@ -294,6 +294,7 @@ export const addProjectMemoryTool: ToolDefinition<
       kind: input.kind,
       key: input.key ?? '',
       content: input.content,
+      metadata: { source: 'agent_recorded' },
     });
     return {
       success: true,

@@ -204,7 +204,7 @@ export const geminiProvider: AiProvider = {
       `${GEMINI_API_BASE}/models/${request.model}:generateContent`,
       {
         method: 'POST',
-        signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+        signal: AbortSignal.any([AbortSignal.timeout(GEMINI_TIMEOUT_MS), ...(request.signal ? [request.signal] : [])]),
         headers: geminiHeaders(apiKey),
         body: JSON.stringify({
           contents,

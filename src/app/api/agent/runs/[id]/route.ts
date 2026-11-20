@@ -59,7 +59,16 @@ export async function GET(
     if (!detail) {
       return NextResponse.json({ error: 'Run not found' }, { status: 404 });
     }
-    return NextResponse.json(detail);
+    return NextResponse.json({
+      run: { id: detail.run.id, status: detail.run.status, projectId: detail.run.projectId,
+        taskId: detail.run.taskId, startedAt: detail.run.startedAt, completedAt: detail.run.completedAt },
+      steps: detail.steps.map(({ id, sequence, stepType, status, description, toolName, output }) => ({
+        id, sequence, stepType, status, description: stepType === 'tool' ? `Tool: ${toolName ?? 'unknown'}` : description,
+        toolName, text: typeof output?.text === 'string' && ['plan', 'respond'].includes(stepType) ? output.text.slice(0, 36000) : null,
+      })),
+      events: detail.events.map(({ id, eventType, createdAt }) => ({ id, eventType, createdAt })),
+      toolAudit: detail.toolAudit.map(({ id, toolName, success, createdAt }) => ({ id, toolName, success, createdAt })),
+    });
   } catch (err) {
     console.error('Failed to load agent run:', err);
     return NextResponse.json({ error: 'Failed to load agent run' }, { status: 500 });

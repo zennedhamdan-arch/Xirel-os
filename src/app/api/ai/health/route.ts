@@ -1,32 +1,18 @@
 import { NextResponse } from 'next/server';
-import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
+import { isPlatformAdmin, requireUser } from '@/lib/api/guards';
 import { getAllProviders } from '@/lib/ai/registry';
+import { rateLimit } from '@/lib/security/rate-limit';
 
-/**
- * Returns configured/health status for every registered AI provider.
- * Requires auth so this doesn't become a public probe of your setup.
- * Actually hits each configured provider's API (not just an env-var
- * check) — this is the place to verify the adapters really work once
- * you have real keys and network access.
- */
 export async function GET() {
-  const supabase = createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  const providers = getAllProviders();
-  const results = await Promise.all(
-    providers.map(async (provider) => ({
-      providerId: provider.id,
-      configured: provider.isConfigured(),
-      health: await provider.healthCheck(),
-    }))
-  );
-
-  return NextResponse.json({ providers: results });
+  const access = await requireUser();
+  if (!access.ok) return access.response;
+  const { userId } = access.ctx;
+  if (!isPlatformAdmin(userId)) return NextResponse.json({ error: 'Platform admin required' }, { status: 403 });
+  if (!rateLimit(`provider-health:${userId}`, 2, 60_000).ok) return NextResponse.json({ error: 'Too many provider probes' }, { status: 429 });
+  const providers = await Promise.all(getAllProviders().map(async provider => {
+    const configured = provider.isConfigured();
+    const available = configured ? (await provider.healthCheck().catch(() => null))?.status === 'healthy' : false;
+    return { providerId: provider.id, configured, available };
+  }));
+  return NextResponse.json({ providers });
 }

@@ -6,7 +6,7 @@
  * Boots a throwaway in-process PostgreSQL (embedded-postgres binaries,
  * fetched from npm), reconstructs the minimal Supabase environment
  * (auth schema + auth.uid() from request.jwt.claims, anon/authenticated
- * roles), applies EVERY migration 0001→0008 in order, then verifies:
+ * roles), applies EVERY migration 0001→0011 in order, then verifies:
  *
  *   1. Migrations apply cleanly, in sequence, with zero errors.
  *   2. THE RLS RECURSION BUG IS FIXED: querying workspace_members (and
@@ -20,11 +20,10 @@
  *      requeue/cancel; schedule firing is idempotent; recovery sweep
  *      fails exhausted abandoned jobs.
  *
- * The queue SQL here mirrors src/lib/jobs/queue.ts statements exactly
+ * The initial queue checks mirror SQL from the queue
  * (the TS wrappers bind to the app's DATABASE_URL singleton with ssl
  * 'require', which a local socket-less test server does not serve) —
- * if you change queue.ts, change them together; the SQL is the
- * contract under test.
+ * the final group additionally exercises the actual route handlers and queue implementation.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -32,6 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import postgres from 'postgres';
+import { testAppIntegration } from './test-app-integration';
 
 let passed = 0;
 let failed = 0;
@@ -93,8 +93,17 @@ async function main(): Promise<void> {
     `);
     check('roles + auth schema + auth.uid() ready', true);
 
+    // Real Supabase grants table privileges to anon/authenticated via
+    // ALTER DEFAULT PRIVILEGES in its platform bootstrap — plain
+    // Postgres does not. Simulate that here (test-env only).
+    await sql.unsafe(`
+      grant usage on schema public to authenticated;
+      alter default privileges in schema public grant select, insert, update, delete on tables to authenticated;
+      grant usage, select on all sequences in schema public to authenticated;
+    `);
+
     // ── apply migrations in order ───────────────────────────
-    group('1) migrations 0001 → 0008 apply cleanly');
+    group('1) migrations 0001 → 0011 apply cleanly');
     const migrationsDir = path.join(__dirname, '..', 'supabase', 'migrations');
     const files = fs
       .readdirSync(migrationsDir)
@@ -135,15 +144,6 @@ async function main(): Promise<void> {
       }
     }
     check('all migrations idempotent on re-run', idempotent);
-
-    // Real Supabase grants table privileges to anon/authenticated via
-    // ALTER DEFAULT PRIVILEGES in its platform bootstrap — plain
-    // Postgres does not. Simulate that here (test-env only).
-    await sql.unsafe(`
-      grant usage on schema public to authenticated;
-      grant select, insert, update, delete on all tables in schema public to authenticated;
-      grant usage, select on all sequences in schema public to authenticated;
-    `);
 
     // ── seed two workspaces + users ─────────────────────────
     const [userA] = await sql`insert into auth.users (email) values ('a@test.dev') returning id`;
@@ -235,10 +235,10 @@ async function main(): Promise<void> {
       }
       check('cross-workspace bos_customers INSERT denied', bosCrossDenied);
 
-      const jobRows = await cn`select id from agent_jobs`;
-      check('agent_jobs visible to members', jobRows.length === 1);
-      const scheduleRows = await cn`select id from agent_schedules`;
-      check('agent_schedules visible to members', scheduleRows.length === 0);
+      const [internal] = await cn`select has_table_privilege(current_user, 'public.agent_jobs', 'SELECT') as jobs,
+        has_table_privilege(current_user, 'public.agent_schedules', 'SELECT') as schedules`;
+      check('raw job state is not readable through the browser role', !internal!.jobs);
+      check('raw schedule state is not readable through the browser role', !internal!.schedules);
     });
 
     // user B (member of ws1 + owner of ws2): sees ws1 + ws2, not "everything"
@@ -428,6 +428,16 @@ async function main(): Promise<void> {
     group('6) platform switches');
     const [pauseSetting] = await sql`select value from system_settings where key='execution_paused'`;
     check('execution_paused defaults to false', pauseSetting!.value === false);
+
+    group('7) real app routes, worker, schedules and approvals');
+    await testAppIntegration(sql, check, { user: userA!.id, other: userB!.id, a: ws1!.id, b: ws2!.id, task: task1!.id });
+    await withUser(userA!.id, async cn => {
+      const [grants] = await cn`select has_table_privilege(current_user,'public.agent_jobs','UPDATE') as jobs,
+        has_table_privilege(current_user,'public.agent_approvals','INSERT') as approvals,
+        has_table_privilege(current_user,'public.messages','INSERT') as messages,
+        has_table_privilege(current_user,'public.bos_products','INSERT') as business`;
+      check('browser cannot write worker-owned state or spoof messages; Business OS retained', !grants!.jobs && !grants!.approvals && !grants!.messages && grants!.business);
+    });
 
   } finally {
     await sql.end();

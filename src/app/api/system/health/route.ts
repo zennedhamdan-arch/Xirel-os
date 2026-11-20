@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { desc } from 'drizzle-orm';
 import { db } from '@/lib/db';
 import { workerHeartbeats } from '@/lib/db/schema';
-import { requireUser } from '@/lib/api/guards';
+import { isPlatformAdmin, requireWorkspaceAccess } from '@/lib/api/guards';
 import {
   countJobsByStatus,
   getOldestPendingJobAgeSeconds,
@@ -22,24 +22,25 @@ export const dynamic = 'force-dynamic';
  * Authenticated users only (platform posture, not secrets — the values
  * are operational counters).
  */
-export async function GET() {
-  const guard = await requireUser();
+export async function GET(request: Request) {
+  const guard = await requireWorkspaceAccess(new URL(request.url).searchParams.get('workspaceId'));
   if (!guard.ok) return guard.response;
 
+  const isGlobalAdmin = isPlatformAdmin(guard.ctx.userId);
   try {
     const [statuses, oldestPendingSeconds, paused, workers] = await Promise.all([
-      countJobsByStatus(),
-      getOldestPendingJobAgeSeconds(),
+      countJobsByStatus(guard.ctx.workspaceId),
+      getOldestPendingJobAgeSeconds(guard.ctx.workspaceId),
       getExecutionPaused(),
-      db.select().from(workerHeartbeats).orderBy(desc(workerHeartbeats.lastHeartbeatAt)).limit(20),
+      isGlobalAdmin ? db.select().from(workerHeartbeats).orderBy(desc(workerHeartbeats.lastHeartbeatAt)).limit(20) : [],
     ]);
 
     const now = Date.now();
-    const health = getProviderHealthSnapshot(now);
+    const health = isGlobalAdmin ? getProviderHealthSnapshot(now) : [];
     // Merge with actual configuration so the surface shows providers
     // that exist but have never been called, too.
     const configuredIds = ['gemini', 'groq', 'qwen', 'moonshot', 'openai', 'anthropic', 'openrouter'] as const;
-    const providers = configuredIds.map((id) => {
+    const providers = (isGlobalAdmin ? configuredIds : []).map((id) => {
       const snapshot = health.find((h) => h.providerId === id);
       let configured = false;
       try {
@@ -53,7 +54,6 @@ export async function GET() {
         lastSuccessAt: snapshot?.lastSuccessAt ?? null,
         lastFailureAt: snapshot?.lastFailureAt ?? null,
         lastErrorClass: snapshot?.lastErrorClass ?? null,
-        lastErrorMessage: snapshot?.lastErrorMessage ?? null,
         lastLatencyMs: snapshot?.lastLatencyMs ?? null,
         cooldownRemainingMs: snapshot?.cooldownRemainingMs ?? 0,
         consecutiveFailures: snapshot?.consecutiveFailures ?? 0,
@@ -62,6 +62,7 @@ export async function GET() {
 
     return NextResponse.json({
       executionPaused: paused,
+      workerOnline: workers.length ? workers.some(w => now - new Date(w.lastHeartbeatAt).getTime() < 60_000) : null,
       queue: {
         byStatus: statuses,
         depth: (statuses['queued'] ?? 0) + (statuses['retrying'] ?? 0),

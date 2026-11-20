@@ -84,7 +84,10 @@ export async function routeGenerateText(request: RouteRequest): Promise<RouteRes
   }
 
   for (const providerId of candidates) {
-    const provider = getProvider(providerId);
+    request.signal?.throwIfAborted();
+    let provider;
+    try { provider = getProvider(providerId); }
+    catch { failedProviders.push({ providerId, error: 'adapter_unavailable' }); continue; }
 
     if (!provider.isConfigured()) {
       failedProviders.push({ providerId, error: 'not_configured' });
@@ -111,6 +114,7 @@ export async function routeGenerateText(request: RouteRequest): Promise<RouteRes
       recordProviderSuccess(providerId, Date.now() - startedAt);
       return { ...response, failedProviders };
     } catch (err) {
+      request.signal?.throwIfAborted();
       const classified = classifyProviderError(err);
       recordProviderFailure(providerId, classified);
       const message = err instanceof AiProviderError ? err.message : String(err);

@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { ProjectWorkItems, type WorkItem } from './project-work-items';
 
 interface JobSummary {
   id: string;
@@ -22,11 +23,13 @@ interface JobSummary {
   attemptCount: number;
   maxAttempts: number;
   lastError: string | null;
+  canRetry: boolean;
   createdAt: string;
 }
 interface ApprovalRow {
   id: string;
   summary: string;
+  args?: Record<string, unknown>;
   toolName: string | null;
   riskLevel: string | null;
   createdAt: string;
@@ -47,7 +50,19 @@ interface ScheduleRow {
   lastRunAt: string | null;
   failureCount: number;
 }
+interface ProjectRow { id: string; name: string; description: string | null; status: string }
+interface ProjectDetail {
+  project: ProjectRow;
+  recentTasks: WorkItem[];
+  memory: { id: string; kind: string; key: string; content: string; updatedAt: string; source: string }[];
+}
+interface RunDetail {
+  run: { id: string; status: string };
+  steps: { id: string; status: string; stepType: string; sequence: number; description: string; text: string | null }[];
+  events: { id: string; eventType: string; createdAt: string }[];
+}
 interface HealthData {
+  workerOnline: boolean | null;
   executionPaused: boolean;
   queue: {
     depth: number;
@@ -113,11 +128,21 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
   const [busy, setBusy] = useState(false);
 
   const [prompt, setPrompt] = useState('');
+  const [chatTask, setChatTask] = useState<string | null>(null);
+  const [turns, setTurns] = useState<{ role: string; text: string }[]>([]);
+  const [projects, setProjects] = useState<ProjectRow[]>([]);
+  const [projectId, setProjectId] = useState('');
+  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
+  const [projectDraft, setProjectDraft] = useState('');
+  const [memoryKey, setMemoryKey] = useState('');
+  const [memoryContent, setMemoryContent] = useState('');
+  const [memoryKind, setMemoryKind] = useState('note');
+  const [selectedRun, setSelectedRun] = useState('');
+  const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [runResult, setRunResult] = useState<{ text: string; runId?: string; status?: string } | null>(null);
   const [scheduleForm, setScheduleForm] = useState({ name: '', cron: '', instructions: '' });
   const [showSchedules, setShowSchedules] = useState(false);
 
-  const workspaceRef = useRef(workspaceId);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchJson = useCallback(async (url: string) => {
@@ -127,28 +152,29 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
   }, []);
 
   const refresh = useCallback(async () => {
-    const ws = workspaceRef.current;
+    const ws = encodeURIComponent(workspaceId);
     try {
-      const [jobsRes, approvalsRes, runsRes, schedulesRes] = await Promise.all([
+      const [jobsRes, approvalsRes, runsRes, schedulesRes, projectsRes] = await Promise.all([
         fetchJson(`/api/agent/jobs?workspaceId=${ws}&limit=10`),
         fetchJson(`/api/agent/approvals?workspaceId=${ws}&status=pending`),
-        fetchJson('/api/agent/runs'),
+        fetchJson(`/api/agent/runs?workspaceId=${ws}`),
         fetchJson(`/api/agent/schedules?workspaceId=${ws}`),
+        fetchJson(`/api/projects?workspaceId=${ws}`),
       ]);
+      setProjects(projectsRes.projects ?? []);
       setJobs(jobsRes.jobs ?? []);
       setApprovals(approvalsRes.approvals ?? []);
       setRuns((runsRes.runs ?? []).slice(0, 8));
       setSchedules(schedulesRes.schedules ?? []);
-      setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'refresh failed');
     }
     try {
-      setHealth(await fetchJson('/api/system/health'));
+      setHealth(await fetchJson(`/api/system/health?workspaceId=${encodeURIComponent(workspaceId)}`));
     } catch {
       /* health is non-critical; keep last snapshot */
     }
-  }, [fetchJson]);
+  }, [fetchJson, workspaceId]);
 
   // Poll loop: staggered, paused when the tab is hidden.
   useEffect(() => {
@@ -165,6 +191,50 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
     };
   }, [refresh]);
 
+  const refreshProject = useCallback(async (id: string) => {
+    if (!id) return;
+    const params = new URLSearchParams({ workspaceId, projectId: id });
+    const data = await fetchJson(`/api/projects?${params}`) as ProjectDetail;
+    return data;
+  }, [fetchJson, workspaceId]);
+
+  useEffect(() => {
+    let active = true;
+    if (projectId) void refreshProject(projectId).then(data => { if (active) setProjectDetail(data ?? null); })
+      .catch(() => { if (active) setError('Project details could not be loaded.'); });
+    return () => { active = false; };
+  }, [projectId, refreshProject]);
+
+  useEffect(() => {
+    if (!selectedRun) return;
+    let active = true;
+    const load = () => void fetchJson(`/api/agent/runs/${encodeURIComponent(selectedRun)}`).then(data => {
+      if (active) setRunDetail(data);
+    }).catch(() => { if (active) setError('Execution details could not be loaded.'); });
+    load();
+    const tick = setInterval(() => { if (!document.hidden) load(); }, 10_000);
+    return () => { active = false; clearInterval(tick); };
+  }, [fetchJson, selectedRun]);
+
+  const selectProject = (id: string) => {
+    setProjectId(id); setProjectDetail(null); setChatTask(null); setTurns([]); setRunResult(null);
+  };
+  const saveProject = async (action: 'create' | 'describe' | 'remember') => {
+    setError(null);
+    try {
+      const res = await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, workspaceId, projectId, name: projectDraft, description: projectDraft,
+          kind: memoryKind, key: memoryKey, content: memoryContent }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Project request failed');
+      if (action === 'create') selectProject(data.id);
+      else setProjectDetail(await refreshProject(projectId) ?? null);
+      if (action === 'remember') { setMemoryKey(''); setMemoryContent(''); }
+      setProjectDraft('');
+      void refresh();
+    } catch (e) { setError(e instanceof Error ? e.message : 'Project request failed'); }
+  };
+
   const askAgent = useCallback(async () => {
     if (!prompt.trim() || busy) return;
     setBusy(true);
@@ -174,13 +244,15 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
       const res = await fetch('/api/agent/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ taskId: null, message: prompt.trim(), workspaceId }),
+        body: JSON.stringify({ taskId: chatTask, message: prompt.trim(), workspaceId, projectId: projectId || undefined }),
       });
       const data = await res.json();
       if (!res.ok) {
         setError(data.error ?? `agent request failed (${res.status})`);
         if (data.runId) setRunResult({ text: data.error ?? 'failed', runId: data.runId, status: data.status });
       } else {
+        setChatTask(data.taskId);
+        setTurns(old => [...old, { role: 'You', text: prompt.trim() }, { role: 'Xirel', text: data.text ?? '' }]);
         setRunResult({ text: data.text ?? '', runId: data.runId, status: data.status });
         if (data.verification?.verified) setNotice('Result verified against the registry.');
       }
@@ -191,7 +263,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
     } finally {
       setBusy(false);
     }
-  }, [prompt, busy, workspaceId, refresh]);
+  }, [prompt, busy, chatTask, workspaceId, projectId, refresh]);
 
   const submitTask = useCallback(async () => {
     if (!prompt.trim() || busy) return;
@@ -202,7 +274,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
       const res = await fetch('/api/agent/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workspaceId, description: prompt.trim() }),
+        body: JSON.stringify({ workspaceId, description: prompt.trim(), projectId: projectId || undefined, idempotencyKey: crypto.randomUUID() }),
       });
       const data = await res.json();
       if (!res.ok && res.status !== 202) {
@@ -221,10 +293,10 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
     } finally {
       setBusy(false);
     }
-  }, [prompt, busy, workspaceId, refresh]);
+  }, [prompt, busy, workspaceId, projectId, refresh]);
 
   const jobAction = useCallback(
-    async (jobId: string, action: 'cancel' | 'pause' | 'resume') => {
+    async (jobId: string, action: 'cancel' | 'pause' | 'resume' | 'retry') => {
       try {
         const res = await fetch(`/api/agent/jobs/${jobId}/actions`, {
           method: 'POST',
@@ -308,7 +380,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
   );
 
   const activeApprovals = approvals.length;
-  const workerOk = (health?.workers ?? []).some((w) => w.staleSeconds < 60);
+  const workerOk = health?.workerOnline;
 
   return (
     <main className="min-h-screen bg-background px-4 py-6 text-slate-100 md:px-8">
@@ -338,7 +410,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
           <div className="rounded-lg border border-border bg-surface p-3">
             <p className="text-[10px] uppercase tracking-wider text-muted">Worker</p>
             <p className={`text-lg font-bold ${workerOk ? 'text-emerald-400' : 'text-red-400'}`}>
-              {health ? (workerOk ? 'online' : 'offline') : '—'}
+              {workerOk === true ? 'online' : workerOk === false ? 'offline' : '—'}
             </p>
           </div>
           <div className="rounded-lg border border-border bg-surface p-3">
@@ -351,10 +423,20 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
 
         {/* Composer */}
         <section className="mb-6 rounded-xl border border-border bg-surface p-4">
+          <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+            <label>Project <select className="ml-2 rounded border border-border bg-black/30 p-2" value={projectId}
+              onChange={e => selectProject(e.target.value)} disabled={busy}>
+              <option value="">No project</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select></label>
+            {chatTask && <button disabled={busy} className="text-primary underline" onClick={() => { setChatTask(null); setTurns([]); setRunResult(null); }}>New conversation</button>}
+          </div>
+          {turns.length > 0 && <div className="mb-3 max-h-80 space-y-3 overflow-y-auto rounded border border-border p-3">
+            {turns.map((turn, i) => <div key={i}><strong className="text-xs">{turn.role}</strong><p className="whitespace-pre-wrap break-words text-sm">{turn.text}</p></div>)}
+          </div>}
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Ask Xirel — e.g. “Prepare three promotional clips for my selected project” or “Check the Soleil deployment”"
+            placeholder="Ask Xirel to review a project, research a topic, or plan the next step"
             rows={3}
             className="w-full resize-none rounded-lg border border-border bg-black/30 p-3 text-sm outline-none focus:border-primary"
           />
@@ -375,7 +457,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
             </button>
             <span className="text-[10px] text-muted">durable tasks keep running after you close this page</span>
           </div>
-          {runResult && (
+          {runResult && (turns.length === 0 || runResult.status === 'failed') && (
             <div className="mt-3 rounded-lg border border-border bg-black/30 p-3 text-sm">
               <p className="whitespace-pre-wrap">{runResult.text || '(no text)'}</p>
               {runResult.runId && (
@@ -395,6 +477,31 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
         )}
 
         <div className="grid gap-4 lg:grid-cols-2">
+          <Card title="Project workspace">
+            <form className="space-y-2" onSubmit={e => { e.preventDefault(); void saveProject(projectId ? 'describe' : 'create'); }}>
+              <input aria-label={projectId ? 'New description' : 'New project name'} value={projectDraft} onChange={e => setProjectDraft(e.target.value)}
+                placeholder={projectId ? 'New project description' : 'New project name'} maxLength={projectId ? 2000 : 120} className="w-full rounded border border-border bg-black/30 p-2 text-xs" />
+              <button disabled={!projectDraft.trim()} className="text-xs text-primary disabled:opacity-50">{projectId ? 'Save description' : 'Create project'}</button>
+            </form>
+            {projectDetail && <div className="mt-4 space-y-3 text-xs">
+              <p className="whitespace-pre-wrap">{projectDetail.project.description || 'No description yet.'}</p>
+              <ProjectWorkItems key={projectDetail.project.id} items={projectDetail.recentTasks} workspaceId={workspaceId}
+                projectId={projectDetail.project.id} refresh={async () => { setProjectDetail(await refreshProject(projectId) ?? null); await refresh(); }} />
+              <p className="font-bold">Project memory</p>
+              <ul className="max-h-60 space-y-2 overflow-y-auto">{projectDetail.memory.map(m => <li key={m.id} className="border-b border-border pb-2">
+                <strong>{m.kind} · {m.key}</strong><p className="whitespace-pre-wrap break-words">{m.content}</p>
+                <small className="text-muted">{m.source} · {new Date(m.updatedAt).toLocaleDateString()}</small></li>)}</ul>
+              <form className="space-y-2" onSubmit={e => { e.preventDefault(); void saveProject('remember'); }}>
+                <select aria-label="Memory kind" value={memoryKind} onChange={e => setMemoryKind(e.target.value)} className="rounded border border-border bg-surface p-2">
+                  {['note', 'decision', 'problem', 'status', 'fact'].map(kind => <option key={kind}>{kind}</option>)}
+                </select>
+                <input aria-label="Memory title" placeholder="Stable title, e.g. architecture" maxLength={80} value={memoryKey} onChange={e => setMemoryKey(e.target.value)} className="w-full rounded border border-border bg-black/30 p-2" />
+                <textarea aria-label="Memory content" placeholder="What should Xirel remember?" maxLength={3000} value={memoryContent} onChange={e => setMemoryContent(e.target.value)} className="w-full rounded border border-border bg-black/30 p-2" />
+                <button disabled={!memoryKey.trim() || !memoryContent.trim()} className="text-primary disabled:opacity-50">Save memory</button>
+              </form>
+            </div>}
+          </Card>
+
           {/* Approvals first — they block work */}
           <Card title={`Approvals${activeApprovals ? ` (${activeApprovals})` : ''}`}>
             {approvals.length === 0 ? (
@@ -408,8 +515,9 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
                       {a.toolName ? `tool: ${a.toolName} · ` : ''}{a.riskLevel ? `risk: ${a.riskLevel} · ` : ''}
                       {new Date(a.createdAt).toLocaleString()}
                     </p>
+                    {a.args && <pre className="my-2 overflow-auto whitespace-pre-wrap text-xs">{JSON.stringify(a.args, null, 2)}</pre>}
                     <div className="mt-2 flex gap-2">
-                      <button onClick={() => decideApproval(a.id, 'approved')} className="rounded-md bg-emerald-800/80 px-3 py-1.5 text-[10px] font-bold">Approve</button>
+                      <button disabled={!a.args} onClick={() => decideApproval(a.id, 'approved')} className="rounded-md bg-emerald-800/80 px-3 py-1.5 text-[10px] font-bold">Approve</button>
                       <button onClick={() => decideApproval(a.id, 'rejected')} className="rounded-md bg-red-900/70 px-3 py-1.5 text-[10px] font-bold">Reject</button>
                     </div>
                   </li>
@@ -419,7 +527,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
           </Card>
 
           {/* Active tasks */}
-          <Card title="Active tasks">
+          <Card title="Recent jobs">
             {jobs.length === 0 ? (
               <p className="text-xs text-muted">No durable tasks yet.</p>
             ) : (
@@ -435,12 +543,13 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
                       <Pill status={j.status} />
-                      {['queued', 'retrying', 'paused'].includes(j.status) && (
+                      {['queued', 'retrying', 'paused', 'running', 'planning', 'verifying', 'claimed', 'waiting_for_approval'].includes(j.status) && (
                         <button onClick={() => jobAction(j.id, 'cancel')} className="text-[10px] text-red-300 hover:underline">cancel</button>
                       )}
                       {['queued', 'claimed', 'planning', 'running', 'verifying', 'retrying'].includes(j.status) && (
                         <button onClick={() => jobAction(j.id, 'pause')} className="text-[10px] text-slate-300 hover:underline">pause</button>
                       )}
+                      {j.canRetry && <button onClick={() => jobAction(j.id, 'retry')} className="text-[10px] text-amber-300 hover:underline">retry</button>}
                       {j.status === 'paused' && (
                         <button onClick={() => jobAction(j.id, 'resume')} className="text-[10px] text-emerald-300 hover:underline">resume</button>
                       )}
@@ -459,12 +568,21 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
               <ul className="space-y-2">
                 {runs.map((r) => (
                   <li key={r.id} className="flex items-center justify-between gap-2 rounded-lg border border-border bg-black/20 p-2.5">
-                    <span className="text-[10px] text-muted">run {r.id.slice(0, 8)}</span>
+                    <button onClick={() => { setRunDetail(null); setSelectedRun(selectedRun === r.id ? '' : r.id); }} className="text-xs text-primary underline">Run {r.id.slice(0, 8)}</button>
                     <Pill status={r.status} />
                   </li>
                 ))}
               </ul>
             )}
+            {selectedRun && runDetail && <div className="mt-4 space-y-3 border-t border-border pt-3 text-xs">
+              <strong>Run {runDetail.run.id.slice(0, 8)} · {runDetail.run.status}</strong>
+              <ol className="max-h-96 space-y-2 overflow-y-auto">{runDetail.steps.map(step => <li key={step.id} className="rounded border border-border p-2">
+                <div className="flex justify-between gap-2"><span>{step.description}</span><Pill status={step.status} /></div>
+                {step.text && <p className="mt-1 whitespace-pre-wrap break-words text-muted">{step.text}</p>}
+              </li>)}</ol>
+              {runDetail.events.length > 0 && <details><summary>Activity events</summary>{runDetail.events.map(e =>
+                <p key={e.id}>{new Date(e.createdAt).toLocaleTimeString()} · {e.eventType.replaceAll('_', ' ')}</p>)}</details>}
+            </div>}
           </Card>
 
           {/* Provider health */}
@@ -484,7 +602,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
                   </span>
                 </li>
               ))}
-              {!health && <p className="text-xs text-muted">Loading…</p>}
+              {health && !health.providers.length && <p className="text-xs text-muted">Provider diagnostics are limited to platform administrators.</p>}
             </ul>
           </Card>
 

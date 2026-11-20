@@ -1,12 +1,13 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
-import { requireWorkspaceAccess } from '@/lib/api/guards';
+import { projectBelongsToWorkspace, requireWorkspaceAccess } from '@/lib/api/guards';
 import { rateLimit } from '@/lib/security/rate-limit';
-import { submitJob, listJobs } from '@/lib/jobs/queue';
+import { submitJob, listJobs, enqueueProjectTask } from '@/lib/jobs/queue';
 import { isJobStatus } from '@/lib/jobs/state-machine';
 
 export const dynamic = 'force-dynamic';
 
+const workspaceTaskSchema = z.object({ workspaceId: z.string().uuid(), taskId: z.string().uuid() }).strict();
 const submitSchema = z.object({
   workspaceId: z.string().uuid(),
   description: z.string().min(1).max(8000),
@@ -16,7 +17,7 @@ const submitSchema = z.object({
   priority: z.number().int().min(-100).max(100).optional(),
   maxAttempts: z.number().int().min(1).max(10).optional(),
   idempotencyKey: z.string().min(1).max(200).optional(),
-});
+}).strict();
 
 /**
  * POST /api/agent/jobs — durable task submission (Phase 3).
@@ -31,7 +32,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const parsed = submitSchema.safeParse(body);
+  const parsed = z.union([workspaceTaskSchema, submitSchema]).safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
       { error: 'Invalid request', details: parsed.error.flatten().fieldErrors },
@@ -52,6 +53,15 @@ export async function POST(request: Request) {
   }
 
   try {
+    if ('taskId' in input) {
+      const result = await enqueueProjectTask(guard.ctx.workspaceId, input.taskId, guard.ctx.userId);
+      if (result === null) return NextResponse.json({ error: 'Work item not found or not owned by caller' }, { status: 404 });
+      if (result === false) return NextResponse.json({ error: 'Work item is not queued or its predecessor is incomplete' }, { status: 409 });
+      return NextResponse.json({ job: { id: result.job.id, status: result.job.status }, created: result.created }, { status: 202 });
+    }
+    if (input.projectId && !(await projectBelongsToWorkspace(guard.ctx.workspaceId, input.projectId))) {
+      return NextResponse.json({ error: 'Project not found' }, { status: 404 });
+    }
     const { job, created } = await submitJob({
       workspaceId: guard.ctx.workspaceId,
       createdBy: guard.ctx.userId,
@@ -114,7 +124,8 @@ export async function GET(request: Request) {
         projectId: j.projectId,
         scheduleId: j.scheduleId,
         currentStep: j.currentStep,
-        lastError: j.lastError,
+        canRetry: j.status === 'failed' && j.checkpoint?.writeAttempt == null,
+        lastError: j.lastError ? "Execution encountered an error." : null,
         nextExecutionAt: j.nextExecutionAt,
         createdAt: j.createdAt,
         completedAt: j.completedAt,

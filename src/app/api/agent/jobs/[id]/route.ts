@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { requireWorkspaceAccess } from '@/lib/api/guards';
+import { requireUser, requireWorkspaceAccess } from '@/lib/api/guards';
 import { getJob } from '@/lib/jobs/queue';
 
 export const dynamic = 'force-dynamic';
@@ -15,6 +15,8 @@ export async function GET(
   _request: Request,
   { params }: { params: { id: string } },
 ) {
+  const session = await requireUser();
+  if (!session.ok) return session.response;
   if (!UUID.test(params.id)) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
@@ -39,15 +41,13 @@ export async function GET(
       attemptCount: job.attemptCount,
       maxAttempts: job.maxAttempts,
       currentStep: job.currentStep,
-      checkpoint: job.checkpoint,
-      lastError: job.lastError,
+      lastError: job.lastError ? "Execution encountered an error." : null,
       errorClass: job.errorClass,
       runId: job.runId,
       projectId: job.projectId,
       taskId: job.taskId,
       scheduleId: job.scheduleId,
       nextExecutionAt: job.nextExecutionAt,
-      leaseOwner: job.leaseOwner,
       leaseExpiresAt: job.leaseExpiresAt,
       heartbeatAt: job.heartbeatAt,
       createdAt: job.createdAt,

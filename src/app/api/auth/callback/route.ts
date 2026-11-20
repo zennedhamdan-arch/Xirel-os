@@ -1,3 +1,4 @@
+import { getSafeAuthRedirect } from '@/lib/auth/redirect';
 import { NextResponse, type NextRequest } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 
@@ -10,7 +11,7 @@ import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
   const code = searchParams.get('code');
-  const redirectTo = searchParams.get('redirectTo') ?? '/dashboard';
+  const redirectTo = getSafeAuthRedirect(searchParams.get('redirectTo'), origin);
 
   if (code) {
     const supabase = createSupabaseServerClient();
@@ -23,5 +24,5 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  return NextResponse.redirect(new URL(redirectTo, origin));
+  return NextResponse.redirect(redirectTo);
 }

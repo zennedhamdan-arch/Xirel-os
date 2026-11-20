@@ -1,29 +1,7 @@
-/**
- * Schedule scanning (Phase 11): the worker periodically claims due
- * schedules (FOR UPDATE SKIP LOCKED — multiple workers never double-fire
- * one schedule) and enqueues a durable job per fire.
- *
- * Duplicate prevention: each enqueued job carries the idempotency key
- * `sched:<scheduleId>:<fireEpochSeconds>` — even if the same fire is
- * processed twice (crash between claim and update), the unique index
- * collapses it into the one already-enqueued job.
- */
-
 import { sql } from 'drizzle-orm';
 import { db } from '@/lib/db';
 import { submitJob } from '@/lib/jobs/queue';
 import { nextCronRun } from './cron';
-
-export interface DueScheduleRow {
-  id: string;
-  workspaceId: string;
-  createdBy: string;
-  projectId: string | null;
-  name: string;
-  instructions: string;
-  taskType: string;
-  cron: string;
-}
 
 export interface FireResult {
   scheduleId: string;
@@ -33,97 +11,38 @@ export interface FireResult {
   error?: string;
 }
 
-/**
- * Claim up to `limit` due schedules and enqueue their jobs.
- * The cron's next run is computed AFTER the fire so a misconfigured cron
- * that never matches still records the attempted fire (and surfaces its
- * error on the schedule row).
- */
+type DueSchedule = { id: string; workspace_id: string; created_by: string; project_id: string | null;
+  name: string; instructions: string; task_type: string; cron: string; next_run_at: string | Date; allowed: boolean };
+
+/** Lock, enqueue and advance the same scheduled occurrence in one transaction. */
 export async function fireDueSchedules(limit = 10, now = new Date()): Promise<FireResult[]> {
-  const claimed = (await db.execute(sql`
-    select id, workspace_id, created_by, project_id, name, instructions, task_type, cron
-    from agent_schedules
-    where status = 'active' and next_run_at <= now()
-    order by next_run_at asc
-    limit ${limit}
-    for update skip locked
-  `)) as unknown as Record<string, unknown>[];
-
   const results: FireResult[] = [];
-
-  for (const row of claimed) {
-    const schedule: DueScheduleRow = {
-      id: row.id as string,
-      workspaceId: row.workspace_id as string,
-      createdBy: row.created_by as string,
-      projectId: (row.project_id as string | null) ?? null,
-      name: row.name as string,
-      instructions: row.instructions as string,
-      taskType: (row.task_type as string) ?? 'scheduled_task',
-      cron: row.cron as string,
-    };
-
-    const fireEpoch = Math.floor(now.getTime() / 1000);
-    const next = nextCronRun(schedule.cron, now);
-    const idempotencyKey = `sched:${schedule.id}:${fireEpoch}`;
-
-    try {
-      const { job, created } = await submitJob({
-        workspaceId: schedule.workspaceId,
-        createdBy: schedule.createdBy,
-        projectId: schedule.projectId,
-        scheduleId: schedule.id,
-        title: `Scheduled: ${schedule.name}`,
-        description: schedule.instructions,
-        taskType: schedule.taskType,
-        idempotencyKey,
-        priority: 0,
-      });
-      if (next) {
-        await db.execute(sql`
-          update agent_schedules
-          set last_run_at = now(),
-              last_job_id = ${job.id},
-              last_error = null,
-              failure_count = 0,
-              run_count = run_count + ${created ? 1 : 0},
-              next_run_at = ${next.toISOString()},
-              updated_at = now()
-          where id = ${schedule.id}
-        `);
-      } else {
-        // Unrepresentable cron (no future match within a year): park it
-        // loudly instead of violating the NOT NULL next_run_at.
-        await db.execute(sql`
-          update agent_schedules
-          set status = 'paused',
-              last_error = 'Cron expression has no future fire time — schedule paused',
-              updated_at = now()
-          where id = ${schedule.id}
-        `);
+  for (let i = 0; i < limit; i++) {
+    const result = await db.transaction(async tx => {
+      const [row] = await tx.execute<DueSchedule>(sql`
+        select s.*, exists(select 1 from workspace_members m where m.workspace_id = s.workspace_id
+          and m.user_id = s.created_by and m.role in ('member','admin','owner')) and
+          (s.project_id is null or exists(select 1 from projects p where p.id = s.project_id
+            and p.workspace_id = s.workspace_id)) as allowed
+        from agent_schedules s where s.status = 'active' and s.next_run_at <= ${now.toISOString()}
+        order by s.next_run_at, s.id limit 1 for update of s skip locked`);
+      if (!row) return null;
+      const next = nextCronRun(row.cron, now);
+      if (!next || !row.allowed) {
+        const error = row.allowed ? 'Schedule has no future occurrence' : 'Schedule owner or project is no longer authorized';
+        await tx.execute(sql`update agent_schedules set status = 'paused', last_error = ${error}, updated_at = now() where id = ${row.id}`);
+        return { scheduleId: row.id, jobId: null, created: false, nextRunAt: null, error };
       }
-      results.push({
-        scheduleId: schedule.id,
-        jobId: job.id,
-        created,
-        nextRunAt: next,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await db.execute(sql`
-        update agent_schedules
-        set last_run_at = now(),
-            last_error = ${message.slice(0, 500)},
-            failure_count = failure_count + 1,
-            ${next
-              ? sql`next_run_at = ${next.toISOString()},`
-              : sql`status = 'paused',`}
-            updated_at = now()
-        where id = ${schedule.id}
-      `);
-      results.push({ scheduleId: schedule.id, jobId: null, created: false, nextRunAt: next, error: message });
-    }
+      const key = `sched:${row.id}:${new Date(row.next_run_at).toISOString()}`;
+      const { job, created } = await submitJob({ workspaceId: row.workspace_id, createdBy: row.created_by,
+        projectId: row.project_id, scheduleId: row.id, title: `Scheduled: ${row.name}`,
+        description: row.instructions, taskType: row.task_type, idempotencyKey: key }, tx);
+      await tx.execute(sql`update agent_schedules set last_run_at = now(), last_job_id = ${job.id}, last_error = null,
+        failure_count = 0, run_count = run_count + ${created ? 1 : 0}, next_run_at = ${next.toISOString()}, updated_at = now() where id = ${row.id}`);
+      return { scheduleId: row.id, jobId: job.id, created, nextRunAt: next };
+    });
+    if (!result) break;
+    results.push(result);
   }
-
   return results;
 }

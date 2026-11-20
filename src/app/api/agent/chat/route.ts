@@ -1,8 +1,10 @@
+import { getExecutionPaused } from '@/lib/jobs/queue';
+import { rateLimit } from '@/lib/security/rate-limit';
+import { projectBelongsToWorkspace, requireTaskAccess, requireWorkspaceAccess } from '@/lib/api/guards';
 import { NextResponse, type NextRequest } from 'next/server';
 import { z } from 'zod';
-import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
-import { workspaceMembers, messages as messagesTable } from '@/lib/db/schema';
+import { messages as messagesTable } from '@/lib/db/schema';
 import { eq, and } from 'drizzle-orm';
 import { getConfiguredProviderInstances } from '@/lib/ai/registry';
 import { runAgentTurn } from '@/lib/agents/runtime';
@@ -61,7 +63,8 @@ const agentChatRequestSchema = z.object({
   taskId: z.string().uuid().optional().nullable(),
   message: z.string().min(1, 'Message cannot be empty').max(10000),
   workspaceId: z.string().uuid(),
-  providerPriority: z.array(z.string()).optional(),
+  projectId: z.string().uuid().optional(),
+  providerPriority: z.array(z.string().max(40)).max(7).optional(),
 });
 
 const VALID_PROVIDER_IDS: AiProviderId[] = [
@@ -75,15 +78,6 @@ const VALID_PROVIDER_IDS: AiProviderId[] = [
 ];
 
 export async function POST(request: NextRequest) {
-  const supabase = createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
   let body: unknown;
   try {
     body = await request.json();
@@ -100,15 +94,18 @@ export async function POST(request: NextRequest) {
   }
 
   const { taskId, message, workspaceId, providerPriority } = parsed.data;
-
-  // Verify workspace membership before doing anything else — the
-  // orchestrator re-checks this internally for tool permission, but
-  // failing fast here avoids creating a task for a non-member.
-  const membership = await db.query.workspaceMembers.findFirst({
-    where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, user.id)),
-  });
-  if (!membership) {
-    return NextResponse.json({ error: 'Not a member of this workspace' }, { status: 403 });
+  const access = taskId
+    ? await requireTaskAccess(taskId, { workspaceId, write: true })
+    : await requireWorkspaceAccess(workspaceId, 'member');
+  if (!access.ok) return access.response;
+  const { userId, workspaceId: authorizedWorkspaceId } = access.ctx;
+  if (await getExecutionPaused()) return NextResponse.json({ error: 'New agent execution is paused' }, { status: 503 });
+  if (!rateLimit(`chat:${userId}`, 20, 60_000).ok) return NextResponse.json({ error: 'Too many chat requests' }, { status: 429 });
+  const suppliedProject = parsed.data.projectId?.toLowerCase();
+  const projectId = taskId ? access.ctx.taskProjectId : suppliedProject;
+  if ((taskId && suppliedProject && suppliedProject !== projectId) ||
+      (projectId && !(await projectBelongsToWorkspace(authorizedWorkspaceId, projectId)))) {
+    return NextResponse.json({ error: 'Project not found for this conversation' }, { status: 404 });
   }
 
   // Resolve provider priority the same way /api/chat does, for consistency.
@@ -129,7 +126,7 @@ export async function POST(request: NextRequest) {
   let currentTaskId = taskId;
   if (!currentTaskId) {
     try {
-      const newTask = await createTask(workspaceId, user.id, message.slice(0, 100));
+      const newTask = await createTask(authorizedWorkspaceId, userId, message.slice(0, 100), projectId);
       currentTaskId = newTask.id;
     } catch (err) {
       console.error('Failed to create task:', err);
@@ -158,9 +155,11 @@ export async function POST(request: NextRequest) {
     // runAgentTurn never throws for agent-side failures — it returns a
     // failed status with the error recorded on the run.
     const result = await runAgentTurn({
-      workspaceId,
-      userId: user.id,
+      workspaceId: authorizedWorkspaceId,
+      userId,
       taskId: currentTaskId,
+      projectId,
+      signal: request.signal,
       message,
       history,
       providerPriority: providers,
@@ -181,7 +180,7 @@ export async function POST(request: NextRequest) {
       }
       return NextResponse.json(
         {
-          error: result.error ?? 'Agent run failed',
+          error: 'Agent run failed; see execution history for status.',
           taskId: currentTaskId,
           runId: result.runId,
           status: result.status,
@@ -238,7 +237,6 @@ export async function POST(request: NextRequest) {
     } catch {
       // Silent — the client already gets the error below.
     }
-    const errMessage = err instanceof Error ? err.message : 'Agent run failed';
-    return NextResponse.json({ error: errMessage, taskId: currentTaskId }, { status: 500 });
+    return NextResponse.json({ error: 'Agent run failed', taskId: currentTaskId }, { status: 500 });
   }
 }

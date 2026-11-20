@@ -1,170 +1,63 @@
-/**
- * Job executor (Phase 4): runs ONE durable job through the EXISTING
- * Xirel Manager (src/lib/agents/runtime.ts) — the worker is a host for
- * the same agent runtime the chat uses, never a competing framework.
- *
- * Ownership discipline: every job mutation is guarded by leaseOwner ===
- * workerId; the lease is renewed by the worker's heartbeat loop while
- * the executor runs. If the worker dies, the lease expires and another
- * worker reclaims the job from its checkpoint.
- */
-
 import { runAgentTurn } from '@/lib/agents/runtime';
-import { getTaskById, ensureTask } from '@/lib/jobs/task-helpers';
-import {
-  attachRunToJob,
-  finishJob,
-  transitionJob,
-  waitForApproval,
-  type JobOutcome,
-} from '@/lib/jobs/queue';
-import type { JobRow } from '@/lib/jobs/queue';
-import type { JobCheckpoint } from '@/lib/jobs/state-machine';
+import { getRun } from '@/lib/agents/runs';
+import { getWorkspaceRole } from '@/lib/jobs/task-helpers';
+import { getProject } from '@/lib/projects/queries';
+import { attachJobTask, attachRunToJob, consumeApproval, finishJob, getJob, markWriteStarted, readApprovalContinuation,
+  transitionJob, waitForApproval, type JobRow } from '@/lib/jobs/queue';
 import { classifyError } from '@/lib/jobs/errors';
 import type { AiProviderId } from '@/lib/ai/types';
+import { getTaskMessagesForAgent } from '@/lib/tasks/queries';
 
-export interface ExecuteContext {
-  workerId: string;
-  leaseSeconds: number;
-  providerPriority: AiProviderId[];
-}
+type ExecuteContext = { workerId: string; providerPriority: AiProviderId[]; signal: AbortSignal };
+type ExecuteResult = { outcome: 'completed' | 'failed' | 'retry_scheduled' | 'waiting_approval' | 'not_owner'; runId?: string; detail?: string };
 
-export interface ExecuteResult {
-  outcome: 'completed' | 'failed' | 'retry_scheduled' | 'waiting_approval' | 'not_owner';
-  runId?: string;
-  detail?: string;
-}
-
-/**
- * Execute a claimed job. The job arrives in `claimed` state with this
- * worker owning the lease. Map the agent turn's result onto queue
- * semantics:
- *   completed            → job completed (checkpoint keeps run/project ids)
- *   waiting_for_approval → job parked, approval row created
- *   failed               → classified: retry with backoff or fail
- */
 export async function executeJob(job: JobRow, ctx: ExecuteContext): Promise<ExecuteResult> {
-  // claimed → running
-  const started = await transitionJob(job.id, ctx.workerId, 'running', {
-    currentStep: 'Starting agent run',
-    checkpoint: { lastStep: 'running' },
-  });
-  if (!started) {
-    return { outcome: 'not_owner', detail: 'lost ownership before start' };
-  }
-
-  const checkpoint = (job.checkpoint ?? {}) as JobCheckpoint;
-  const approvedTools = checkpoint.approvedTools ?? [];
-  const resuming = approvedTools.length > 0;
-
-  // Resolve/attach the conversation task: reuse the job's task when it
-  // has one, otherwise create a dedicated task for this job so messages,
-  // runs, and audit rows all hang off the existing structures.
-  const taskId = await ensureTaskForJob(job);
-
-  const message = resuming
-    ? `A human approved the previously blocked action(s): ${approvedTools.join(', ')}. ` +
-      `Continue the original task from its checkpoint. Original instructions:\n\n${job.description}`
-    : job.description;
-
+  const { workerId, signal } = ctx;
+  const checkActive = async () => {
+    signal.throwIfAborted();
+    const current = await getJob(job.id);
+    if (current?.leaseOwner !== workerId || current.status !== 'running' || !current.leaseExpiresAt ||
+        new Date(current.leaseExpiresAt).getTime() <= Date.now()) throw new Error('Job lease lost or job stopped');
+    const role = await getWorkspaceRole(job.workspaceId, job.createdBy);
+    if (!role || role === 'viewer') throw new Error('Workspace execution permission was revoked');
+  };
+  if (!(await transitionJob(job.id, workerId, 'running', { currentStep: 'Starting agent run' }))) return { outcome: 'not_owner' };
   try {
-    const turn = await runAgentTurn({
-      workspaceId: job.workspaceId,
-      userId: job.createdBy,
-      taskId,
-      message,
-      history: [],
-      providerPriority: ctx.providerPriority,
-      approvedTools: resuming ? approvedTools : undefined,
+    await checkActive();
+    if (job.projectId && !(await getProject(job.workspaceId, job.projectId))) throw new Error('Project not found in workspace');
+    // A worker may die after saving the final run but before finalizing its job.
+    if (job.runId && (await getRun(job.workspaceId, job.runId))?.status === 'completed') {
+      const state = await finishJob(job.id, workerId, { kind: 'completed' });
+      return { outcome: state === 'completed' ? 'completed' : 'not_owner', runId: job.runId };
+    }
+    if (job.checkpoint?.writeAttempt != null) throw new Error('Manual review required after interrupted write');
+    const taskId = await attachJobTask(job.id, workerId);
+    const receipt = typeof job.checkpoint?.approvalId === 'string' ? job.checkpoint.approvalId : null;
+    const action = receipt ? await readApprovalContinuation(job, receipt) : null;
+    if (receipt && !action) throw new Error('Approval expired or requires manual review');
+    const message = action ? `${job.description}\nContinuation reference (not authorization): a human reviewed this exact action: ${JSON.stringify(action)}. Resume within the original objective; the server independently validates authorization.` : job.description;
+    const turn = await runAgentTurn({ workspaceId: job.workspaceId, userId: job.createdBy, taskId,
+      projectId: job.projectId, message, history: await getTaskMessagesForAgent(taskId), signal,
+      providerPriority: ctx.providerPriority, checkActive, beforeWrite: () => markWriteStarted(job.id, workerId),
+      onRunCreated: runId => attachRunToJob(job.id, workerId, runId),
+      consumeApproval: (tool, args) => receipt ? consumeApproval(job, workerId, receipt, tool, args) : Promise.resolve(false),
     });
-
-    await attachRunToJob(job.id, ctx.workerId, turn.runId, turn.projectId ?? undefined);
-
-    const progress: JobCheckpoint = {
-      runId: turn.runId,
-      ...(turn.projectId ? { projectId: turn.projectId } : {}),
-      lastStep: turn.status,
-      notes: turn.error ?? undefined,
-    };
-
+    if (turn.status === 'waiting_for_approval' && turn.pendingAction) {
+      const { toolName, riskLevel, args } = turn.pendingAction;
+      const waiting = await waitForApproval({ jobId: job.id, workerId, runId: turn.runId,
+        summary: turn.text, toolName, riskLevel, args });
+      return { outcome: waiting ? 'waiting_approval' : 'not_owner', runId: turn.runId };
+    }
     if (turn.status === 'completed') {
-      const outcome: JobOutcome = { kind: 'completed', checkpoint: progress };
-      const state = await finishJob(job.id, ctx.workerId, outcome);
+      const state = await finishJob(job.id, workerId, { kind: 'completed', checkpoint: { runId: turn.runId } });
       return { outcome: state === 'completed' ? 'completed' : 'not_owner', runId: turn.runId };
     }
-
-    if (turn.status === 'waiting_for_approval') {
-      const parsed = parseApprovalRequest(turn.error ?? '');
-      const approval = await waitForApproval({
-        jobId: job.id,
-        workerId: ctx.workerId,
-        summary:
-          parsed.summary ??
-          turn.text?.slice(0, 400) ??
-          turn.error ??
-          'The agent requests approval to continue.',
-        toolName: parsed.toolName,
-        payload: { runId: turn.runId, requestedTools: parsed.toolName ? [parsed.toolName] : [] },
-      });
-      if (!approval) {
-        return { outcome: 'not_owner', runId: turn.runId, detail: 'could not park for approval' };
-      }
-      return { outcome: 'waiting_approval', runId: turn.runId, detail: approval.approvalId };
-    }
-
-    // failed — classify honestly, retry only transient classes
-    const classified = classifyError({
-      message: turn.error ?? 'Agent turn failed without a specific error.',
-    });
-    const state = await finishJob(job.id, ctx.workerId, {
-      kind: 'failed_permanently',
-      error: classified,
-      checkpoint: progress,
-    });
-    return {
-      outcome: state === 'retrying' ? 'retry_scheduled' : state === 'failed' ? 'failed' : 'not_owner',
-      runId: turn.runId,
-      detail: classified.errorClass,
-    };
+    throw new Error(turn.error ?? 'Execution did not complete');
   } catch (error) {
-    // Unexpected executor crash (provider outage, bug, transient DB):
-    // classify from the throwable so genuine outages retry.
-    const { classifyThrownError } = await import('@/lib/jobs/errors');
-    const classified = classifyThrownError(error);
-    const state = await finishJob(job.id, ctx.workerId, {
-      kind: 'failed_permanently',
-      error: classified,
-    });
-    return {
-      outcome: state === 'retrying' ? 'retry_scheduled' : state === 'failed' ? 'failed' : 'not_owner',
-      detail: classified.errorClass,
-    };
+    const message = error instanceof Error ? error.message : '';
+    const safe = message === 'Manual review required after interrupted write' ? message :
+      message === 'Provider unavailable or timed out' ? 'Provider timeout' : 'Execution did not complete';
+    const state = await finishJob(job.id, workerId, { kind: 'failed_permanently', error: classifyError({ message: safe }) });
+    return { outcome: state === 'retrying' ? 'retry_scheduled' : state === 'failed' ? 'failed' : 'not_owner', detail: safe };
   }
-}
-
-/** Extract tool name + human summary from the runtime's APPROVAL_REQUIRED signal. */
-function parseApprovalRequest(error: string): { toolName: string | null; summary: string | null } {
-  const match = /APPROVAL_REQUIRED:\s*tool\s+"([^"]+)"/i.exec(error);
-  if (match) {
-    return { toolName: match[1] ?? null, summary: error };
-  }
-  return { toolName: null, summary: error || null };
-}
-
-/**
- * Ensure a task row exists for the job. Reuses the job's task when
- * present (chat-initiated jobs), else creates one owned by the job's
- * requesting user — tasks are the anchor for messages/runs/audit.
- */
-async function ensureTaskForJob(job: JobRow): Promise<string> {
-  if (job.taskId) {
-    const existing = await getTaskById(job.taskId);
-    if (existing && existing.workspaceId === job.workspaceId) return job.taskId;
-  }
-  return ensureTask({
-    workspaceId: job.workspaceId,
-    userId: job.createdBy,
-    title: job.title,
-    description: job.description,
-  });
 }
