@@ -18,9 +18,12 @@ import { projectFileTool, projectEditTool, projectCommandTool } from './worktree
 import { namespaceRunnerEnabled } from '@/lib/execution/sandbox';
 import { projectScope } from '@/lib/execution/files';
 import { githubWriteScope } from '@/lib/connectors/github-changes';
+import { githubHubTool } from './github-hub';
+import { hubAiEnabled } from '@/lib/github-hub/store';
 import { allowedResearchOrigins } from '@/lib/connectors/research';
 
 const TOOL_REGISTRY: Record<string, ToolDefinition<any, any>> = {
+  [githubHubTool.name]: githubHubTool,
   [githubReadTool.name]: githubReadTool,
   [githubInspectTool.name]: githubInspectTool,
   [githubPublishTool.name]: githubPublishTool,
@@ -44,6 +47,7 @@ export function getTool(name: string): ToolDefinition<any, any> | undefined {
 
 export function getAllTools(workspaceId?: string, projectId?: string | null, durable = false): ToolDefinition<any, any>[] {
   return Object.values(TOOL_REGISTRY).filter(tool => {
+    if (tool === githubHubTool) return !!workspaceId && hubAiEnabled();
     if (tool === githubPublishTool) return durable && !!githubWriteScope(workspaceId, projectId);
     if (tool === projectFileTool || tool === projectEditTool) return durable && !!projectScope(workspaceId, projectId);
     if (tool === projectCommandTool) return durable && !!projectScope(workspaceId, projectId) && namespaceRunnerEnabled();

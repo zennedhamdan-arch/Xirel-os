@@ -5,7 +5,7 @@ if (!process.env.DATABASE_URL) {
 }
 
 export default {
-  schema: './src/lib/db/schema.ts',
+  schema: ['./src/lib/db/schema.ts', './src/lib/db/github-hub-schema.ts'],
   out: './supabase/migrations',
   dialect: 'postgresql',
   dbCredentials: {

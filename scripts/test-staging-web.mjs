@@ -42,6 +42,15 @@ try {
   assert.equal(target.origin + target.pathname, `${expectedOrigin}/login`);
   assert.equal(target.searchParams.get('redirectTo'), clientTarget);
   await command.body?.cancel();
+  const hub = await request('/github?workspace=10000000-1000-4000-8000-000000000000');
+  assert.equal(hub.status, 307);
+  const hubLogin = new URL(hub.headers.get('location'));
+  assert.equal(hubLogin.pathname, '/login');
+  assert.equal(hubLogin.searchParams.get('redirectTo'), '/github?workspace=10000000-1000-4000-8000-000000000000');
+  await hub.body?.cancel();
+  const hubApi = await request('/api/github-hub?workspace=10000000-1000-4000-8000-000000000000');
+  assert.equal(hubApi.status, 401);
+  await hubApi.body?.cancel();
   const badCallback = await request(`/api/auth/callback?${new URLSearchParams({ error: 'access_denied', redirectTo: retiredOrigin })}`, forged);
   assert.equal(badCallback.status, 307);
   const failure = new URL(badCallback.headers.get('location'));

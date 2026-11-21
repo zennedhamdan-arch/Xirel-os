@@ -70,6 +70,10 @@ Provider keys (Gemini/OpenRouter/Groq) enable AI features — unconfigured
 providers are skipped, never faked. Render configuration lives in
 `render.yaml` (manual deploy; secrets stay in the dashboard).
 
+## GitHub Hub
+
+Open **GitHub Hub** from Dashboard or Command Center to connect GitHub identities and explore their authorized repositories. See the [GitHub Hub setup and staging checklist](docs/github-hub.md) for App permissions, environment configuration, and opt-in agent sharing.
+
 ## Optional project tooling
 
 See [project execution and rollout](docs/project-execution.md) for the staging worktree, Linux presets, approval-bound GitHub publishing, public research and OpenRouter role configuration. See the [dependency audit](docs/dependency-audit-2026-11-20.md) for the Next.js upgrade and remaining development-only findings.

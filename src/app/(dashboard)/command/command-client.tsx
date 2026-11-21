@@ -393,6 +393,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
           <nav className="flex items-center gap-3 text-xs text-muted">
             <Link className="hover:text-slate-100" href="/chat">Chat</Link>
             <Link className="hover:text-slate-100" href="/dashboard">Dashboard</Link>
+            <Link className="hover:text-slate-100" href={`/github?workspace=${workspaceId}`}>GitHub Hub</Link>
             <Link className="hover:text-slate-100" href="/business">Business OS</Link>
           </nav>
         </header>

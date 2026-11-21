@@ -67,6 +67,10 @@ export default async function DashboardPage() {
           <SignOutButton origin={getAppOrigin()} />
         </div>
 
+        {firstWorkspace && <Link href={`/github?workspace=${firstWorkspace.id}`} className="mb-6 block rounded-xl border border-border bg-surface p-5 hover:border-primary/50">
+          <span className="font-semibold">GitHub Hub</span><span className="mt-1 block text-sm text-muted">Connect identities and explore repository work in this workspace.</span>
+        </Link>}
+
         {configuredProviders.length > 0 && firstWorkspace && (
           <div className="mb-6 rounded-xl border border-border bg-surface/50 p-6">
             <Link

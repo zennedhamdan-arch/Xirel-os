@@ -6,7 +6,7 @@
  * Boots a throwaway in-process PostgreSQL (embedded-postgres binaries,
  * fetched from npm), reconstructs the minimal Supabase environment
  * (auth schema + auth.uid() from request.jwt.claims, anon/authenticated
- * roles), applies EVERY migration 0001→0011 in order, then verifies:
+ * roles), applies EVERY migration 0001→0012 in order, then verifies:
  *
  *   1. Migrations apply cleanly, in sequence, with zero errors.
  *   2. THE RLS RECURSION BUG IS FIXED: querying workspace_members (and
@@ -31,6 +31,7 @@ import os from 'node:os';
 import postgres from 'postgres';
 import { checkStagingSchema } from './staging-schema-check';
 import { testStagingWorker } from './test-staging-worker';
+import { testGitHubHub } from './test-github-hub';
 import { testAppIntegration } from './test-app-integration';
 
 let passed = 0;
@@ -99,7 +100,7 @@ async function main(): Promise<void> {
     check('roles + auth schema + auth.uid() ready', true);
 
     // ── apply migrations in order ───────────────────────────
-    group('1) migrations 0001 → 0011 apply cleanly');
+    group('1) migrations 0001 → 0012 apply cleanly');
     const migrationsDir = path.join(__dirname, '..', 'supabase', 'migrations');
     const files = fs
       .readdirSync(migrationsDir)
@@ -427,7 +428,10 @@ async function main(): Promise<void> {
     const [pauseSetting] = await sql`select value from system_settings where key='execution_paused'`;
     check('execution_paused defaults to false', pauseSetting!.value === false);
 
-    group('7) real app routes, worker, schedules and approvals');
+    group('7) GitHub Hub (real DB, mocked GitHub and session)');
+    await testGitHubHub(sql, check, { user: userA!.id, peer: userB!.id, workspace: ws1!.id, otherWorkspace: ws2!.id });
+
+    group('7a) real app routes, worker, schedules and approvals');
     await testAppIntegration(sql, check, { user: userA!.id, other: userB!.id, a: ws1!.id, b: ws2!.id, task: task1!.id });
 
     group('7b) Render membership probe through the application client');
@@ -471,7 +475,7 @@ async function main(): Promise<void> {
         has_table_privilege('authenticated','public.agent_jobs','SELECT') as can_read_jobs,
         (select ssl from pg_stat_ssl where pid=pg_backend_pid()) as tls
         from tasks t join messages m on m.task_id=t.id cross join agent_jobs j where t.id=${legacyTask!.id} and j.id=${legacyJob!.id}`;
-      check('populated 0008 → 0011 upgrade and reapply preserve conversation, project memory and job', preserved?.content === 'legacy conversation' &&
+      check('populated 0008 → 0012 upgrade and reapply preserve conversation, project memory and job', preserved?.content === 'legacy conversation' &&
         preserved.memo === 'legacy memory' && preserved.status === 'completed' && preserved.priority === 0 && preserved.parent_task_id === null && preserved.blocked_by_task_id === null);
       check('populated upgrade closes browser grants and DB test connection is encrypted', preserved?.can_insert === false && preserved.can_read_jobs === false && preserved.tls === true);
       const preflight = await checkStagingSchema(upgrade);

@@ -9,16 +9,9 @@ import { NextResponse } from 'next/server';
 import { and, eq } from 'drizzle-orm';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
-import { projects, tasks, workspaceMembers, type workspaceRoleEnum } from '@/lib/db/schema';
-
-type WorkspaceRole = (typeof workspaceRoleEnum.enumValues)[number];
-
-const ROLE_RANK: Record<WorkspaceRole, number> = {
-  viewer: 0,
-  member: 1,
-  admin: 2,
-  owner: 3,
-};
+import { projects, tasks, workspaceMembers } from '@/lib/db/schema';
+import { isUuid, lookupWorkspaceRole, ROLE_RANK, type WorkspaceRole } from '@/lib/workspaces/access';
+export { isUuid } from '@/lib/workspaces/access';
 
 export interface WorkspaceAccessContext {
   userId: string;
@@ -45,30 +38,22 @@ export async function requireWorkspaceAccess(
   return authorizeWorkspace(session.ctx.userId, workspaceId, minRole);
 }
 
-export const isUuid = (value: string | null | undefined): value is string =>
-  !!value && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
-
 const denied = (status: number, error: string) =>
   ({ ok: false as const, response: NextResponse.json({ error }, { status }) });
 
 async function authorizeWorkspace(userId: string, workspaceId: string | null | undefined, minRole: WorkspaceRole): Promise<GuardResult> {
   if (!isUuid(workspaceId)) return denied(400, 'A valid workspaceId is required');
   workspaceId = workspaceId.toLowerCase();
-  const rows = await db
-    .select({ role: workspaceMembers.role })
-    .from(workspaceMembers)
-    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)))
-    .limit(1);
+  const role = await lookupWorkspaceRole(userId, workspaceId);
 
-  const membership = rows[0];
-  if (!membership) {
+  if (!role) {
     return {
       ok: false,
       response: NextResponse.json({ error: 'Workspace not found or access denied' }, { status: 403 }),
     };
   }
 
-  if (ROLE_RANK[membership.role] < ROLE_RANK[minRole]) {
+  if (ROLE_RANK[role] < ROLE_RANK[minRole]) {
     return {
       ok: false,
       response: NextResponse.json(
@@ -78,7 +63,7 @@ async function authorizeWorkspace(userId: string, workspaceId: string | null | u
     };
   }
 
-  return { ok: true, ctx: { userId, workspaceId, role: membership.role } };
+  return { ok: true, ctx: { userId, workspaceId, role } };
 }
 
 /** Authenticate only (no workspace context) — for system endpoints. */
