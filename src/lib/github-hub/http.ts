@@ -11,7 +11,9 @@ export const hubPath = (workspace: string | undefined, notice: string) => `/gith
 export const sameOrigin = (request: Request) => request.headers.get('origin') === getAppOrigin();
 export const hubJson = (data: unknown, status = 200) => NextResponse.json(data, { status, headers: hubHeaders });
 export function hubFailure(error: unknown) {
-  return error instanceof HubError ? hubJson({ error: error.message }, error.status) : hubJson({ error: 'GitHub Hub is temporarily unavailable.' }, 502);
+  return error instanceof HubError
+    ? hubJson({ error: error.diagnostics?.map(reason => reason.message).join(' ') || error.message, ...(error.diagnostics ? { diagnostics: error.diagnostics } : {}) }, error.status)
+    : hubJson({ error: 'GitHub Hub is temporarily unavailable.' }, 502);
 }
 export const ghIdInput = z.string().regex(githubNumericId);
 export const pageInput = z.coerce.number().int().min(1).max(500);

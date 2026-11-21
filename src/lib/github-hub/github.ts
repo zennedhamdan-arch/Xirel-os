@@ -3,8 +3,14 @@ import { z } from 'zod';
 import { readConnectorJson } from '@/lib/connectors/read-json';
 import { safeGitHubPath } from '@/lib/connectors/read-only';
 
+type DiscoveryDiagnostic = {
+  code: 'installation_suspended' | 'missing_installation_account' | 'missing_required_permission' |
+    'unexpected_permission' | 'permission_not_read_only' | 'github_api_request_failure' | 'installation_not_found';
+  message: string;
+};
+
 export class HubError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string, public diagnostics?: DiscoveryDiagnostic[]) { super(message); }
 }
 const ghId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER).transform(String);
 const text = (limit: number) => z.string().transform(value => value.slice(0, limit));
@@ -20,8 +26,13 @@ const repository = z.object({ id: ghId, name: z.string().regex(/^[\w.-]{1,100}$/
   visibility: z.enum(['public', 'private', 'internal']).optional(), default_branch: text(250), updated_at: text(40).nullish(), html_url: source,
   permissions: z.object({ pull: z.boolean().optional(), push: z.boolean().optional(), admin: z.boolean().optional(),
     maintain: z.boolean().optional(), triage: z.boolean().optional() }).optional() });
-const orgInstallation = z.object({ id: ghId, account: z.object({ login: handle, type: z.string() }).nullable(),
-  repository_selection: text(40), permissions: z.record(z.string(), z.string()), suspended_at: z.string().nullish() });
+const installationAccount = z.union([
+  z.object({ login: handle, type: z.enum(['User', 'Organization']) }),
+  // GitHub's installation schema also permits an enterprise account with a slug, not login/type.
+  z.object({ slug: handle }).transform(({ slug }) => ({ login: slug, type: 'Enterprise' as const })),
+]);
+const orgInstallation = z.object({ id: ghId, account: z.unknown().optional(), repository_selection: z.enum(['all', 'selected']),
+  permissions: z.unknown().optional(), suspended_at: z.string().nullish() });
 const count = z.number().int().nonnegative();
 const shaSchema = z.string().regex(/^[a-f0-9]{40}$/i);
 const commit = z.object({ sha: shaSchema, html_url: source, commit: z.object({ message: text(500), author: z.object({ name: text(100), date: text(40) }).nullable() }) });
@@ -36,7 +47,41 @@ const apiOrigin = 'https://api.github.com';
 export const repoPageSize = 20;
 const small = 12;
 export const githubNumericId = /^[1-9]\d{0,15}$/;
-const readPermissions = new Set(['metadata', 'contents', 'issues', 'pull_requests']);
+const requiredPermissions = {
+  metadata: 'Metadata', contents: 'Contents', issues: 'Issues', pull_requests: 'Pull requests',
+} as const;
+type RequiredPermission = keyof typeof requiredPermissions;
+const permissionKeys = Object.keys(requiredPermissions) as RequiredPermission[];
+const isRequiredPermission = (key: string): key is RequiredPermission => Object.hasOwn(requiredPermissions, key);
+
+function inspectInstallation(item: z.infer<typeof orgInstallation>) {
+  const diagnostics: DiscoveryDiagnostic[] = [];
+  const account = installationAccount.safeParse(item.account).data ?? null;
+  if (item.suspended_at != null) diagnostics.push({ code: 'installation_suspended', message: 'Installation suspended. Ask the installation owner to restore it in GitHub.' });
+  if (!account) diagnostics.push({ code: 'missing_installation_account', message: 'Missing installation account. Verify the App installation in GitHub.' });
+
+  const grants = item.permissions && typeof item.permissions === 'object' && !Array.isArray(item.permissions)
+    ? item.permissions as Record<string, unknown> : {};
+  const permissions: Partial<Record<RequiredPermission | 'single_file', 'read'>> = {};
+  for (const key of permissionKeys) {
+    if (!Object.hasOwn(grants, key)) {
+      diagnostics.push({ code: 'missing_required_permission', message: `Missing required permission: ${requiredPermissions[key]} (read-only).` });
+    } else if (grants[key] !== 'read') {
+      diagnostics.push({ code: 'permission_not_read_only', message: `Permission not read-only: ${requiredPermissions[key]}.` });
+    } else permissions[key] = 'read';
+  }
+  // Single-file read adds no capability to Contents read. Don't enable it in the App,
+  // but tolerate it if present. Never accept other extra grants or write/elevated values.
+  const extras = Object.entries(grants).filter(([key]) => !isRequiredPermission(key) && key !== 'single_file');
+  if (extras.length) diagnostics.push({ code: 'unexpected_permission', message: 'Unexpected permission. Remove grants outside the GitHub Hub read-only policy.' });
+  if (extras.some(([, value]) => value !== 'read')) diagnostics.push({ code: 'permission_not_read_only', message: 'Permission not read-only: an unexpected grant is not read-only.' });
+  if (Object.hasOwn(grants, 'single_file')) {
+    if (grants.single_file === 'read') permissions.single_file = 'read';
+    else diagnostics.push({ code: 'permission_not_read_only', message: 'Permission not read-only: Single file.' });
+  }
+  // Fixed keys and values only. Do not send GitHub's raw grants or its response to the browser.
+  return { id: item.id, account, repository_selection: item.repository_selection, permissions, diagnostics, usable: diagnostics.length === 0 };
+}
 
 async function request(path: string, token: string, query: Record<string, string> = {}, signal?: AbortSignal) {
   const url = new URL(apiOrigin + path);
@@ -59,22 +104,42 @@ export type RepoSelection = { installation: string; installationPage: number; re
 const pageQuery = (page: number, perPage: number) => ({ page: String(page), per_page: String(perPage) });
 
 export async function identity(token: string) { return githubUser.parse(await request('/user', token)); }
+async function discoveryRequest<T>(kind: 'installations' | 'repositories', schema: z.ZodType<T>, path: string, token: string, page: number, signal?: AbortSignal) {
+  let payload: unknown;
+  try {
+    payload = await request(path, token, pageQuery(page, repoPageSize), signal);
+  } catch (error) {
+    const status = error instanceof HubError ? error.status : 502;
+    const message = `GitHub API request failure while listing ${kind}.` + (error instanceof HubError ? ` ${error.message}` : ' Try again.');
+    throw new HubError(status, error instanceof HubError ? error.message : 'GitHub is temporarily unavailable.', [{ code: 'github_api_request_failure', message }]);
+  }
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    const message = `GitHub API request failure: invalid ${kind} response.`;
+    throw new HubError(502, 'GitHub returned an invalid response.', [{ code: 'github_api_request_failure', message }]);
+  }
+  return parsed.data;
+}
+
+const installationPageSchema = z.object({ total_count: count, installations: z.array(orgInstallation) });
+const repositoryPageSchema = z.object({ total_count: count, repositories: z.array(repository) });
 export async function listInstallations(token: string, page: number, signal?: AbortSignal) {
-  const result = z.object({ total_count: count, installations: z.array(orgInstallation) }).parse(
-    await request('/user/installations', token, pageQuery(page, repoPageSize), signal));
-  return { items: result.installations.map(item => ({ ...item, usable: !!item.account && !item.suspended_at &&
-    !!item.permissions.metadata && Object.entries(item.permissions).every(([key, value]) => readPermissions.has(key) && value === 'read') })),
-    hasNext: page * repoPageSize < result.total_count };
+  const result = await discoveryRequest('installations', installationPageSchema, '/user/installations', token, page, signal);
+  return { items: result.installations.map(inspectInstallation), hasNext: page * repoPageSize < result.total_count };
 }
 
 async function verifyInstallation(token: string, installation: string, page: number, signal?: AbortSignal) {
   const { items } = await listInstallations(token, page, signal);
-  if (!items.some(item => item.id === installation && item.usable)) throw new HubError(404, 'Installation is not available with this read-only connection. Refresh accounts and installations.');
+  const item = items.find(item => item.id === installation);
+  if (!item) {
+    const message = 'Installation not found for the connected identity on this page. Refresh installations and select it again.';
+    throw new HubError(404, 'Installation is not available for this connection.', [{ code: 'installation_not_found', message }]);
+  }
+  if (!item.usable) throw new HubError(403, 'Installation is not available for this read-only connection.', item.diagnostics);
 }
 
 async function repositoryPage(token: string, installation: string, page: number, signal?: AbortSignal) {
-  return z.object({ total_count: count, repositories: z.array(repository) }).parse(
-    await request(`/user/installations/${installation}/repositories`, token, pageQuery(page, repoPageSize), signal));
+  return discoveryRequest('repositories', repositoryPageSchema, `/user/installations/${installation}/repositories`, token, page, signal);
 }
 
 export async function discoverRepositories(token: string, installation: string, installationPage: number, page: number, query: string, visibility: string, signal?: AbortSignal) {

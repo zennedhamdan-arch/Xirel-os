@@ -129,7 +129,12 @@ export default function Hub({ workspace, installUrl }: { workspace: string; inst
           <div className="space-y-2">{installations.data?.items.map(item => <article className="rounded-md border border-border p-3" key={item.id}>
             <button className={button} type="button" aria-pressed={installation === item.id} disabled={!item.usable} onClick={() => { setInstallation(item.id); setRepoPage(1); setChosen(null); }}>
               {item.account?.login ?? 'Unavailable'} <span className="text-xs text-slate-400">{item.account?.type}</span></button>
-            <p className="mt-2 text-xs text-slate-400"><ShieldCheck size={13} className="mr-1 inline" />{item.repository_selection} repositories · {item.usable ? Object.entries(item.permissions).map(([key, value]) => `${key.replaceAll('_', ' ')}: ${value}`).join(' · ') : 'Paused, unavailable or not configured with permitted read-only access'}</p>
+            <p className="mt-2 text-xs text-slate-400"><ShieldCheck size={13} className="mr-1 inline" />{item.repository_selection} repositories
+              {item.usable && <> · {Object.entries(item.permissions).map(([key, value]) => `${key.replaceAll('_', ' ')}: ${value}`).join(' · ')}</>}
+            </p>
+            {!item.usable && <ul className="mt-2 space-y-1 text-xs text-amber-200">
+              {item.diagnostics.map(reason => <li key={reason.message}>{reason.message}</li>)}
+            </ul>}
           </article>)}</div>
           <Pager label="Installation pages" page={installationPage} next={!!installations.data?.hasNext} set={p => { setInstallationPage(p); setInstallation(''); setChosen(null); }} />
         </Result>

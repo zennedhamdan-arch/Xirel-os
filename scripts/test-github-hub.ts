@@ -44,6 +44,8 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
   let exchanges = 0;
   let downstream = 0;
   let providerDenied = false;
+  let repoApiError = false;
+  let installationPages: ((page: number) => unknown) | null = null;
   let revokedRepo = false;
   let unsafeFile = false;
   let issueTransport = false;
@@ -68,9 +70,12 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
     if (path === '/user') return Response.json({ id: token === aToken ? 901 : 902, login: token === aToken ? 'alice' : 'bob', avatar_url: 'https://avatars.githubusercontent.com/u/901?v=4' });
     if (providerDenied) return Response.json({ message: 'never echo provider response' }, { status: 429 });
     if (path === '/user/installations') {
+      if (token === aToken && installationPages) return Response.json(installationPages(page));
       const id = token === aToken ? 71 : 72;
-      return Response.json({ total_count: 1, installations: [{ id, account: { login: token === aToken ? 'alice' : 'team', type: token === aToken ? 'User' : 'Organization' }, repository_selection: 'selected', permissions: permission }] });
+      return Response.json({ total_count: 1, installations: [{ id, account: { login: token === aToken ? 'alice' : 'team', type: token === aToken ? 'User' : 'Organization' }, repository_selection: 'selected',
+        permissions: token === aToken ? { ...permission, single_file: 'read' } : permission }] });
     }
+    if (repoApiError && path === '/user/installations/71/repositories') return Response.json({ message: 'never echo repository API failure' }, { status: 503 });
     if (path === '/user/installations/71/repositories' && token === aToken) return Response.json({ total_count: 21,
       repositories: revokedRepo ? [] : page === 1 ? [repo(81, 'alice', 'personal')] : [repo(82, 'alice', 'second-page')] });
     if (path === '/user/installations/72/repositories' && token === bToken) return Response.json({ total_count: 1, repositories: [repo(91, 'team', 'internal-repo', true)] });
@@ -146,21 +151,92 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
       team.items[0]?.owner.login === 'team' && team.items[0]?.visibility === 'private' && personal.hasNext && nextPage.items[0]?.id === '82' && !nextPage.hasNext);
     const search = await read(await get({ view: 'repositories', account: a, installation: '71', installationPage: '1', repoPage: '1', q: 'second-page', visibility: 'public' })) as { items: { id: string; accessPage: number }[] };
     check('GitHub Hub searches across bounded roster pages without losing the original access page', search.items.length === 1 && search.items[0]?.id === '82' && search.items[0]?.accessPage === 2);
+    const miss = await get({ view: 'overview', account: b, ...selection });
     check('GitHub Hub denies wrong identity, wrong installation, or repo not in authorized page before repository GET',
-      (await get({ view: 'overview', account: b, ...selection })).status === 404 &&
+      miss.status === 404 && JSON.stringify(await read(miss)).includes('installation_not_found') &&
       (await get({ view: 'overview', account: a, ...selection, repo: '91' })).status === 404 && downstream === 0 &&
       !routes.some(route => route.token === bToken && route.path.includes('/71/')));
     user = ids.peer;
-    check('GitHub Hub isolates connections from other members and workspaces', (await get({ view: 'installations', account: a })).status === 404 &&
-      (await get({ view: 'installations', account: a }, ids.otherWorkspace)).status === 404);
+    const deniedCalls = routes.length;
+    const deniedPeer = await get({ view: 'installations', account: a });
+    const deniedWorkspace = await get({ view: 'installations', account: a }, ids.otherWorkspace);
+    check('GitHub Hub isolates diagnostics from other members and workspaces before contacting GitHub', deniedPeer.status === 404 &&
+      deniedWorkspace.status === 404 && routes.length === deniedCalls && !JSON.stringify(await read(deniedPeer)).includes('diagnostics') &&
+      !JSON.stringify(await read(deniedWorkspace)).includes('diagnostics'));
     user = ids.user;
     check('GitHub Hub denies non-members and enforces RLS on the browser-facing database role', (await get({}, ids.otherWorkspace)).status === 403 &&
       (await sql`select count(*)::int as count from pg_class where relrowsecurity and relname like 'github_hub_%'`)[0]?.count === 4 &&
       (await sql`select has_table_privilege('authenticated', 'public.github_hub_accounts', 'SELECT') as allowed`)[0]?.allowed === false);
     providerDenied = true;
     const errorRes = await get({ view: 'installations', account: a });
-    check('GitHub Hub reports provider rate/permission errors without raw payloads', errorRes.status === 429 && !JSON.stringify(await read(errorRes)).includes('never echo'));
+    const providerFailureBody = JSON.stringify(await read(errorRes));
+    check('GitHub Hub reports installation API failures without raw payloads', errorRes.status === 429 &&
+      providerFailureBody.includes('github_api_request_failure') && !providerFailureBody.includes('never echo'));
     providerDenied = false;
+    type Installation = { id: string; usable: boolean; permissions: Record<string, string>; diagnostics: { code: string; message: string }[]; account: { login: string; type: string } | null };
+    const list = async (account: string, page = '1') => {
+      const res = await get({ view: 'installations', account, page });
+      return { res, data: await read(res) as { items: Installation[]; hasNext: boolean; diagnostics?: { code: string }[] } };
+    };
+    const standard = (await list(b)).data.items[0];
+    const redundant = (await list(a)).data.items[0];
+    check('GitHub Hub accepts the exact read-only profile and only the compatible single_file read extra in discovery',
+      !!standard?.usable && standard.diagnostics.length === 0 && !!redundant?.usable && redundant.permissions.single_file === 'read' && personal.items[0]?.id === '81');
+
+    const example = { id: 71, account: { login: 'alice', type: 'User' }, repository_selection: 'selected', permissions: permission };
+    const rawUnexpected = 'never-echo-extra-permission-with-secret';
+    const { pull_requests: _pull, ...noPull } = permission;
+    installationPages = () => ({ total_count: 9, installations: [
+      { ...example, permissions: noPull },
+      { ...example, id: 73, permissions: { ...permission, [rawUnexpected]: 'read' } },
+      { ...example, id: 74, permissions: { ...permission, contents: 'write', single_file: 'write' } },
+      { ...example, id: 75, suspended_at: '2026-11-20T00:00:00Z' },
+      { ...example, id: 76, account: null },
+      { ...example, id: 77, account: undefined },
+      { ...example, id: 78, permissions: { ...permission, issues: { raw: rawUnexpected } } },
+      { ...example, id: 79, account: { slug: 'venture-corp', name: 'Venture Corp' } },
+      { ...example, id: 80, permissions: null },
+    ] });
+    const policies = await list(a);
+    const item = (id: string) => policies.data.items.find(row => row.id === id);
+    const codes = (id: string) => item(id)?.diagnostics.map(reason => reason.code) ?? [];
+    check('GitHub Hub reports a missing required grant, including an absent permissions map', codes('71').includes('missing_required_permission') &&
+      !!item('71')?.diagnostics[0]?.message.includes('Pull requests') && codes('80').length === 4);
+    check('GitHub Hub rejects an unapproved read-only extra without returning its raw name', !item('73')?.usable &&
+      codes('73').includes('unexpected_permission') && !JSON.stringify(policies.data).includes(rawUnexpected));
+    check('GitHub Hub rejects writes and unknown access levels without exposing raw values', !item('74')?.usable &&
+      codes('74').filter(code => code === 'permission_not_read_only').length === 2 && codes('78').includes('permission_not_read_only') &&
+      !JSON.stringify(policies.data).includes(rawUnexpected));
+    check('GitHub Hub diagnoses suspended installations and null or absent accounts without breaking the page',
+      !item('75')?.usable && codes('75').includes('installation_suspended') && codes('76').includes('missing_installation_account') &&
+      codes('77').includes('missing_installation_account'));
+    check('GitHub Hub parses GitHub’s enterprise account shape', !!item('79')?.usable && item('79')?.account?.login === 'venture-corp' && item('79')?.account?.type === 'Enterprise');
+    const repositoryCalls = () => routes.filter(r => r.path.includes('/installations/71/repositories')).length;
+    const prior = repositoryCalls();
+    const blocked = await get({ view: 'repositories', account: a, ...selection });
+    check('GitHub Hub revalidates policy before discovery and returns owner-only reasons without fetching repositories', blocked.status === 403 &&
+      blocked.headers.get('cache-control')?.includes('no-store') === true && JSON.stringify(await read(blocked)).includes('missing_required_permission') &&
+      repositoryCalls() === prior);
+
+    installationPages = page => ({ total_count: 21, installations: [page === 1 ? { ...example, id: 99 } : example] });
+    const first = await list(a);
+    const second = await list(a, '2');
+    const moved = await get({ view: 'repositories', account: a, ...selection });
+    check('GitHub Hub keeps installation pagination and only discovers from the observed authorized page', first.data.hasNext &&
+      !second.data.hasNext && moved.status === 404 && JSON.stringify(await read(moved)).includes('installation_not_found') &&
+      (await get({ view: 'repositories', account: a, ...selection, installationPage: '2' })).ok);
+    installationPages = () => ({ malformed: rawUnexpected });
+    const malformed = await list(a);
+    check('GitHub Hub reports malformed installation responses safely', malformed.res.status === 502 &&
+      malformed.data.diagnostics?.[0]?.code === 'github_api_request_failure' && !JSON.stringify(malformed.data).includes(rawUnexpected));
+    installationPages = null;
+    repoApiError = true;
+    const repoFailure = await get({ view: 'repositories', account: a, ...selection });
+    const repoFailureBody = JSON.stringify(await read(repoFailure));
+    check('GitHub Hub reports repository listing API failures separately without raw responses', repoFailure.status === 502 &&
+      repoFailureBody.includes('github_api_request_failure') && repoFailureBody.includes('listing repositories') && !repoFailureBody.includes('never echo'));
+    repoApiError = false;
+
     const listing = await read(await get({ view: 'files', account: a, ...selection })) as { kind: string; login: string };
     const issues = await read(await get({ view: 'issues', account: a, ...selection })) as { items: unknown[] };
     check('GitHub Hub serves a bounded file tree and distinguishes issues from pulls', listing.kind === 'directory' && listing.login === 'alice' && issueTransport && issues.items.length === 1);
