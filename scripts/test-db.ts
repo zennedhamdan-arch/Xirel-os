@@ -6,7 +6,7 @@
  * Boots a throwaway in-process PostgreSQL (embedded-postgres binaries,
  * fetched from npm), reconstructs the minimal Supabase environment
  * (auth schema + auth.uid() from request.jwt.claims, anon/authenticated
- * roles), applies EVERY migration 0001→0012 in order, then verifies:
+ * roles), applies EVERY migration 0001→0015 in order, then verifies:
  *
  *   1. Migrations apply cleanly, in sequence, with zero errors.
  *   2. THE RLS RECURSION BUG IS FIXED: querying workspace_members (and
@@ -100,7 +100,7 @@ async function main(): Promise<void> {
     check('roles + auth schema + auth.uid() ready', true);
 
     // ── apply migrations in order ───────────────────────────
-    group('1) migrations 0001 → 0012 apply cleanly');
+    group('1) migrations 0001 → 0015 apply cleanly');
     const migrationsDir = path.join(__dirname, '..', 'supabase', 'migrations');
     const files = fs
       .readdirSync(migrationsDir)
@@ -467,15 +467,29 @@ async function main(): Promise<void> {
         (${legacyWs!.id},${legacyUser!.id},'Prior Job','Already complete','completed') returning id`;
       await upgrade`insert into messages (task_id,role,content) values (${legacyTask!.id},'user','legacy conversation')`;
       await upgrade`insert into project_memory (project_id,workspace_id,kind,key,content) values (${legacyProject!.id},${legacyWs!.id},'decision','staging','legacy memory')`;
-      for (const file of files.slice(8)) await applyMigration(upgrade, file);
-      for (const file of files.slice(8)) await applyMigration(upgrade, file);
+      for (const file of files.slice(8, 13)) await applyMigration(upgrade, file);
+      const [legacyAccount] = await upgrade`insert into github_hub_accounts(workspace_id,user_id,github_id,login)
+        values (${legacyWs!.id},${legacyUser!.id},'501','fixture') returning id`;
+      const legacyPin = 'f'.repeat(40);
+      await upgrade`insert into studio_sites(project_id,workspace_id,user_id,account_id,repo_id,selection,repository,head)
+        values (${legacyProject!.id},${legacyWs!.id},${legacyUser!.id},${legacyAccount!.id},'1001','{}', '{"defaultBranch":"legacy/release"}',${legacyPin})`;
+      await upgrade`insert into studio_reports(project_id,commit_sha,profile) values (${legacyProject!.id},${legacyPin},'{"sentinel":true}')`;
+      await upgrade`insert into studio_work(project_id,commit_sha,plan,digest,change_digest,review) values
+        (${legacyProject!.id},${legacyPin},'{"title":"Preserved"}','legacy-plan','legacy-change','approved')`;
+      for (let i = 0; i < 2; i++) for (const file of files.slice(13)) await applyMigration(upgrade, file);
+      const [studio] = await upgrade`select s.working_branch,s.source_sha,b.branch,w.branch_version,w.plan,w.change_digest,w.review
+        from studio_sites s join studio_branch_reports b using(project_id) join studio_work w using(project_id)
+        where s.project_id=${legacyProject!.id}`;
+      check('populated Studio V1 upgrade preserves branch, source, profile association and legacy approved review without reusing approval',
+        studio?.working_branch === 'legacy/release' && studio?.source_sha === legacyPin && studio?.branch === 'legacy/release' &&
+        studio?.branch_version === null && studio?.plan?.title === 'Preserved' && studio?.change_digest === 'legacy-change' && studio?.review === 'approved');
       const [preserved] = await upgrade`select t.parent_task_id,t.blocked_by_task_id,t.priority,m.content,j.status,
         (select content from project_memory where project_id=${legacyProject!.id}) as memo,
         has_table_privilege('authenticated','public.tasks','INSERT') as can_insert,
         has_table_privilege('authenticated','public.agent_jobs','SELECT') as can_read_jobs,
         (select ssl from pg_stat_ssl where pid=pg_backend_pid()) as tls
         from tasks t join messages m on m.task_id=t.id cross join agent_jobs j where t.id=${legacyTask!.id} and j.id=${legacyJob!.id}`;
-      check('populated 0008 → 0012 upgrade and reapply preserve conversation, project memory and job', preserved?.content === 'legacy conversation' &&
+      check('populated 0008 → 0015 upgrade and reapply preserve conversation, project memory and job', preserved?.content === 'legacy conversation' &&
         preserved.memo === 'legacy memory' && preserved.status === 'completed' && preserved.priority === 0 && preserved.parent_task_id === null && preserved.blocked_by_task_id === null);
       check('populated upgrade closes browser grants and DB test connection is encrypted', preserved?.can_insert === false && preserved.can_read_jobs === false && preserved.tls === true);
       const preflight = await checkStagingSchema(upgrade);

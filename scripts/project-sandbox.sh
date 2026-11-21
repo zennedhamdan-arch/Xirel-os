@@ -29,8 +29,7 @@ mount -t proc -o ro,nosuid,nodev,noexec proc "$root/proc"
 # No host /dev, /run, /home, /var, application files, credential mounts or network.
 # Low file-size, memory and CPU ceilings complement process/PID isolation.
 case "$preset" in
-  test) set -- npm --ignore-scripts run test ;;
-  build) set -- npm --ignore-scripts run build ;;
+  test|build|lint|typecheck|test:integration) set -- npm --ignore-scripts run "$preset" ;;
   node-test) set -- node --test ;;
   *) exit 64 ;;
 esac

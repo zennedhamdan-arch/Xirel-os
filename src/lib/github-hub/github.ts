@@ -1,6 +1,8 @@
 import 'server-only';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { readConnectorJson } from '@/lib/connectors/read-json';
+import { isStudioBranch } from '@/lib/studio/branches';
 import { safeGitHubPath } from '@/lib/connectors/read-only';
 
 type DiscoveryDiagnostic = {
@@ -237,10 +239,30 @@ export async function readPinnedFile(token: string, repo: HubRepo, pin: string, 
 }
 
 /** Studio calls only after verifying the actor's installation and repository roster. */
-export async function studioHead(token: string, repo: HubRepo, signal?: AbortSignal) {
-  const branch = z.object({ commit: z.object({ sha: shaSchema }) }).parse(await request(
-    `${pathFor(repo)}/branches/${encodeURIComponent(repo.default_branch)}`, token, {}, signal));
-  return branch.commit.sha;
+const studioBranch = z.object({ name: z.string().optional(), protected: z.boolean().optional(), commit: z.object({ sha: shaSchema.transform(v => v.toLowerCase()) }) });
+
+export async function studioBranches(token: string, repo: HubRepo, page: number, signal?: AbortSignal) {
+  const rows = z.array(studioBranch.extend({ name: z.string() })).max(50).parse(await request(`${pathFor(repo)}/branches`, token, pageQuery(page, 50), signal));
+  return { items: rows.filter(row => isStudioBranch(row.name)).map(row => ({ name: row.name, sha: row.commit.sha,
+    protected: row.protected ?? null, isDefault: row.name === repo.default_branch })), hasNext: rows.length === 50 };
+}
+
+export async function studioBranchHead(token: string, repo: HubRepo, name: string, signal?: AbortSignal) {
+  if (!isStudioBranch(name)) throw new HubError(400, 'Invalid Git branch name.');
+  try {
+    const branch = studioBranch.extend({ name: z.string() }).parse(await request(`${pathFor(repo)}/branches/${encodeURIComponent(name)}`, token, {}, signal));
+    if (branch.name !== name) throw new HubError(502, 'GitHub returned a different branch.');
+    return { name, sha: branch.commit.sha, protected: branch.protected ?? null, isDefault: name === repo.default_branch };
+  } catch (err) {
+    if (err instanceof HubError && err.status === 404) throw new HubError(404, 'This branch was deleted or is not accessible to this GitHub connection.');
+    throw err;
+  }
+}
+
+export async function studioCompare(token: string, repo: HubRepo, base: string, head: string, signal?: AbortSignal) {
+  return z.object({ status: z.enum(['ahead','behind','diverged','identical']), ahead_by: count, behind_by: count,
+    merge_base_commit: z.object({ sha: shaSchema }) }).parse(await request(
+    `${pathFor(repo)}/compare/${shaSchema.parse(base)}...${shaSchema.parse(head)}`, token, pageQuery(1, 1), signal));
 }
 
 export async function studioTree(token: string, repo: HubRepo, sha: string, signal?: AbortSignal) {
@@ -254,4 +276,16 @@ export async function studioTree(token: string, repo: HubRepo, sha: string, sign
     const result = tree.parse(await request(`${root}/git/trees/${commitTreeEntry.sha}`, token, {}, signal));
     return { items: result.tree.slice(0, 1200), limited: true };
   }
+}
+
+/** Bounded byte-exact snapshot input for the separately authorized executor. */
+export async function studioSnapshotFile(token: string, repo: HubRepo, path: string, expected: string, signal?: AbortSignal) {
+  shaSchema.parse(expected);
+  if (!safeGitHubPath(path) || !safeBrowsePath(path)) throw new HubError(422, 'Snapshot contains an unsupported path.');
+  const data = blob.extend({ size: count.max(48_000) }).parse(await request(`${pathFor(repo)}/git/blobs/${expected}`, token, {}, signal));
+  const bytes = Buffer.from(data.content, 'base64');
+  const digest = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+  if (digest !== expected || data.sha !== expected || bytes.length !== data.size || bytes.includes(0)) throw new HubError(422, 'Snapshot blob could not be verified as bounded text.');
+  try { return { path, text: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }; }
+  catch { throw new HubError(422, 'Snapshot contains unsupported binary data.'); }
 }

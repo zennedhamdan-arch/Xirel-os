@@ -5,6 +5,7 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import { NextRequest } from 'next/server';
 import type postgres from 'postgres';
 import { testWebsiteStudio } from './test-website-studio';
+import type { ExecutionInput } from '../src/lib/studio/executor-protocol';
 import type { AiRequest } from '../src/lib/ai/types';
 import * as schema from '../src/lib/db/schema';
 
@@ -26,6 +27,8 @@ function repo(id: number, owner: string, name: string, isPrivate = false) {
 
 export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user: string; peer: string; workspace: string; otherWorkspace: string }) {
   const config = { APP_URL: origin, GITHUB_HUB_CLIENT_ID: 'fixture-id', GITHUB_HUB_CLIENT_SECRET: appSecret,
+    STUDIO_EXECUTOR_ENABLE: 'verified-companion', STUDIO_EXECUTOR_URL: 'https://executor.example.test', STUDIO_PREVIEW_ORIGIN: 'https://preview.example.test',
+    STUDIO_EXECUTOR_TOKEN: 'fixture-companion-bearer-01234567899876',
     GITHUB_HUB_APP_SLUG: 'xirel-fixture', GITHUB_HUB_ENCRYPTION_KEY: Buffer.alloc(32, 73).toString('base64'), GITHUB_HUB_AI_ENABLED: 'true' };
   const previous = Object.keys(config).map(key => [key, process.env[key]] as const);
   Object.assign(process.env, config);
@@ -61,9 +64,14 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
   let installationPages: ((page: number) => unknown) | null = null;
   let revokedRepo = false;
   let head = pin;
-  let studioTree: 'normal' | 'large' | 'malformed' = 'normal';
+  let branchDeleted = false;
+  let studioTree: 'normal' | 'large' | 'malformed' | 'execute' = 'normal';
   let unsafeFile = false;
   let issueTransport = false;
+  const sent: ExecutionInput[] = [];
+  let mismatchExecution = false;
+  const index = '<!doctype html><html><body>Exact source fixture</body></html>';
+  const indexBlob = createHash('sha1').update(`blob ${Buffer.byteLength(index)}\0`).update(index).digest('hex');
   const routes: { token: string; path: string; page: number }[] = [];
   globalThis.fetch = (async (request, opts) => {
     const url = new URL(String(request));
@@ -75,6 +83,18 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
       if (body.get('client_secret') !== appSecret || body.get('redirect_uri') !== `${origin}/api/github-hub/callback` ||
         challenges.get(code) !== createHash('sha256').update(body.get('code_verifier') ?? '').digest('base64url')) return Response.json({}, { status: 422 });
       return Response.json({ access_token: code.startsWith('alice') ? aToken : bToken, expires_in: 28_800, refresh_token: 'fixture-refresh-token-never-store' });
+    }
+    if (url.origin === config.STUDIO_PREVIEW_ORIGIN && opts.method === 'HEAD' && !new Headers(opts.headers).has('authorization')) return new Response(null, { headers: { 'content-type': 'text/html', 'x-xirel-studio-preview': 'static-v1' } });
+    if (url.origin === config.STUDIO_EXECUTOR_URL) {
+      if (new Headers(opts.headers).get('authorization') !== `Bearer ${config.STUDIO_EXECUTOR_TOKEN}`) return Response.json({}, { status: 401 });
+      const input = opts.method === 'POST' ? JSON.parse(String(opts.body)) as ExecutionInput : sent.find(record => url.pathname.endsWith(record.id));
+      if (!input) return Response.json({}, { status: 404 });
+      if (opts.method === 'POST') sent.push(input);
+      const now = new Date().toISOString();
+      return Response.json({ id: input.id, branch: input.branch, commit: mismatchExecution ? '9'.repeat(40) : input.commit, changeDigest: input.changeDigest,
+        mode: input.mode, state: opts.method === 'DELETE' ? 'cancelled' : opts.method === 'POST' ? 'running' : 'passed',
+        environment: 'linux-user-mount-net-pid-namespace-v1', started: now, ended: opts.method === 'POST' ? null : now,
+        checks: [], preview: opts.method === 'GET' ? { url: `${config.STUDIO_PREVIEW_ORIGIN}/p/${'a'.repeat(48)}/`, expires: new Date(Date.now() + 60_000).toISOString() } : null });
     }
     if (url.origin !== 'https://api.github.com' || (opts.method && opts.method !== 'GET')) throw new Error('unsafe fixture request');
     const token = new Headers(opts.headers).get('authorization')?.replace('Bearer ', '') ?? '';
@@ -96,9 +116,17 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
     if (path === '/user/installations/72/repositories' && token === bToken) return Response.json({ total_count: 1, repositories: [repo(91, 'team', 'internal-repo', true)] });
     if (path.startsWith('/repos/alice/personal') && token === aToken) {
       downstream++;
-      if (path.endsWith('/branches/main')) return Response.json({ commit: { sha: head } });
+      const branches = [{ name: 'main', protected: true, commit: { sha: head } }, { name: 'feature/redesign', protected: false, commit: { sha: pin } },
+        ...(!branchDeleted ? [{ name: 'staging', protected: false, commit: { sha: 'a'.repeat(40) } }] : [])];
+      if (path.endsWith('/branches')) return Response.json(branches);
+      if (path.includes('/branches/')) {
+        const branch = branches.find(item => item.name === decodeURIComponent(path.split('/branches/')[1]!));
+        return branch ? Response.json(branch) : Response.json({}, { status: 404 });
+      }
+      if (path.endsWith(`/compare/${pin}...${'a'.repeat(40)}`)) return Response.json({ status: 'ahead', ahead_by: 1, behind_by: 0, merge_base_commit: { sha: pin } });
       if (path.endsWith(`/git/commits/${pin}`) || path.endsWith(`/git/commits/${'a'.repeat(40)}`)) return Response.json({ tree: { sha: tree } });
       if (path.endsWith(`/git/trees/${tree}`)) {
+        if (studioTree === 'execute') return Response.json({ truncated: false, tree: [{ path: 'index.html', mode: '100644', type: 'blob', sha: indexBlob }] });
         if (studioTree === 'malformed') return Response.json({ unexpected: true });
         const files = [{ path: 'README.md', mode: '100644', type: 'blob', sha: blob }];
         if (studioTree === 'large') files.push({ path: 'package.json', mode: '100644', type: 'blob', sha: '1'.repeat(40) },
@@ -106,6 +134,7 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
           { path: 'symlink.html', mode: '120000', type: 'blob', sha: blob });
         return Response.json({ truncated: studioTree === 'large' && url.searchParams.has('recursive'), tree: files });
       }
+      if (path.endsWith(`/git/blobs/${indexBlob}`)) return Response.json({ content: Buffer.from(index).toString('base64'), size: Buffer.byteLength(index), sha: indexBlob, encoding: 'base64' });
       for (const [sha, body] of [['1'.repeat(40), '{"dependencies":{"next":"^15"},"scripts":{"build":"next build"}}'],
         ['2'.repeat(40), '<html><head></head><body>Fixture website</body></html>']]) {
         if (path.endsWith(`/git/blobs/${sha}`)) return Response.json({ content: Buffer.from(body!).toString('base64'), size: body!.length, sha, encoding: 'base64' });
@@ -282,8 +311,8 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
       !(await githubHubTool.execute({ ...file, path: 'other.txt' }, ctx)).success && !(await githubHubTool.execute(file, { ...ctx, userId: ids.peer })).success);
     await post({ ...share, enabled: false });
     await testWebsiteStudio(sql, check, { origin, workspace: ids.workspace, otherWorkspace: ids.otherWorkspace, owner: ids.user, peer: ids.peer,
-      account: a, otherAccount: b, pin, setUser: id => { user = id; }, setHead: commit => { head = commit; }, setTree: variant => { studioTree = variant; },
-      setRevoked: value => { revokedRepo = value; }, share: enabled => post({ ...share, enabled }), provider });
+      account: a, otherAccount: b, pin, setDeleted: value => { branchDeleted = value; }, setUser: id => { user = id; }, setHead: commit => { head = commit; }, setTree: variant => { studioTree = variant; },
+      setRevoked: value => { revokedRepo = value; }, share: enabled => post({ ...share, enabled }), provider, sent, setMismatch: value => { mismatchExecution = value; } });
     process.env.GITHUB_HUB_AI_ENABLED = 'false';
     check('GitHub Hub AI deployment switch denies reads and new grants even for an authorized account', !(await githubHubTool.execute(file, ctx)).success &&
       (await post(share)).status === 403 && (await get({ view: 'overview', account: a, ...selection })).ok);

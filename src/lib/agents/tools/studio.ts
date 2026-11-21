@@ -1,6 +1,7 @@
 import 'server-only';
 import { z } from 'zod';
-import { draftWebsiteFile, websiteEvidence } from '@/lib/studio/service';
+import { agentWebsiteBranches, draftWebsiteFile, websiteEvidence } from '@/lib/studio/service';
+import { isStudioBranch } from '@/lib/studio/branches';
 import { studioToolName } from '@/lib/studio/types';
 import { HubError } from '@/lib/github-hub/github';
 import type { ToolDefinition } from './types';
@@ -28,5 +29,22 @@ export const studioDraftTool: ToolDefinition<z.infer<typeof draft>> = {
     if (!ctx.projectId || !ctx.studioJobId) return { success: false, error: 'This tool requires an active approved Studio job.' };
     try { return { success: true, output: await draftWebsiteFile(ctx, ctx.projectId, ctx.taskId, ctx.studioJobId, input.operation === 'replace' ? input : {}, ctx.signal) }; }
     catch (e) { return { success: false, error: e instanceof HubError ? e.message : 'Studio draft could not be completed.' }; }
+  },
+};
+
+const branch = z.string().min(1).max(250);
+const branchQuery = z.object({ projectId: z.string().uuid(), page: z.number().int().min(1).max(500).optional(), branch: branch.optional(),
+  base: branch.optional(), head: branch.optional() }).strict();
+export const studioBranchTool: ToolDefinition<z.infer<typeof branchQuery>> = {
+  name: 'website_list_branches', description: 'List a selected public opted-in Studio project’s GitHub branches, look up an exact branch, or compare named base and head. Ask the user to select the Studio project if ambiguous. Switching, building, previewing and publishing require the human Studio UI; never claim they happened.',
+  inputSchema: branchQuery, inputJsonSchema: z.toJSONSchema(branchQuery), outputDescription: 'Selected branch and bounded branch metadata or exact commit comparison.',
+  riskLevel: 'safe', requiredPermission: 'member',
+  async execute(input, ctx) {
+    if (ctx.projectId && input.projectId !== ctx.projectId) return { success: false, error: 'Select the matching Studio project.' };
+    if ([input.branch, input.base, input.head].some(value => value !== undefined && !isStudioBranch(value)) || (!!input.base !== !!input.head) ||
+        (input.branch && input.base)) return { success: false, error: 'Provide either one exact valid branch or both base and head.' };
+    try { return { success: true, output: await agentWebsiteBranches(ctx, input.projectId, input.page ?? 1, input.branch,
+      input.base && input.head ? { base: input.base, head: input.head } : undefined, ctx.signal) }; }
+    catch (e) { return { success: false, error: e instanceof HubError ? e.message : 'Branch metadata could not be loaded.' }; }
   },
 };

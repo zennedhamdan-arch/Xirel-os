@@ -22,10 +22,11 @@ import { githubHubTool } from './github-hub';
 import { hubAiEnabled } from '@/lib/github-hub/store';
 import { allowedResearchOrigins } from '@/lib/connectors/research';
 
-import { studioDraftTool, studioEvidenceTool } from './studio';
+import { studioBranchTool, studioDraftTool, studioEvidenceTool } from './studio';
 
 const TOOL_REGISTRY: Record<string, ToolDefinition<any, any>> = {
   [studioDraftTool.name]: studioDraftTool,
+  [studioBranchTool.name]: studioBranchTool,
   [studioEvidenceTool.name]: studioEvidenceTool,
   [githubHubTool.name]: githubHubTool,
   [githubReadTool.name]: githubReadTool,
@@ -53,7 +54,7 @@ export function getAllTools(workspaceId?: string, projectId?: string | null, dur
   return Object.values(TOOL_REGISTRY).filter(tool => {
     if (studioJobId) return tool === studioDraftTool && !!projectId && durable && hubAiEnabled();
     if (tool === studioDraftTool) return false;
-    if (tool === studioEvidenceTool) return !!workspaceId && hubAiEnabled();
+    if (tool === studioEvidenceTool || tool === studioBranchTool) return !!workspaceId && hubAiEnabled();
     if (tool === githubHubTool) return !!workspaceId && hubAiEnabled();
     if (tool === githubPublishTool) return durable && !!githubWriteScope(workspaceId, projectId);
     if (tool === projectFileTool || tool === projectEditTool) return durable && !!projectScope(workspaceId, projectId);

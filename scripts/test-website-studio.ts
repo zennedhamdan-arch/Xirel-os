@@ -1,14 +1,16 @@
+import type { ExecutionInput } from '../src/lib/studio/executor-protocol';
 import type postgres from 'postgres';
 import { studioDiff } from '../src/lib/studio/diff';
 import { studioJobType } from '../src/lib/studio/types';
 
 export async function testWebsiteStudio(sql: postgres.Sql, check: (label: string, ok: boolean) => void, fixture: {
   origin: string; workspace: string; otherWorkspace: string; owner: string; peer: string; account: string; otherAccount: string;
-  pin: string; setUser: (id: string) => void; setHead: (commit: string) => void; setRevoked: (value: boolean) => void;
-  setTree: (variant: 'large' | 'normal' | 'malformed') => void; share: (enabled: boolean) => Promise<Response>;
+  pin: string; setDeleted: (value: boolean) => void; setUser: (id: string) => void; setHead: (commit: string) => void; setRevoked: (value: boolean) => void;
+  setTree: (variant: 'large' | 'normal' | 'malformed' | 'execute') => void; share: (enabled: boolean) => Promise<Response>;
+  sent: ExecutionInput[]; setMismatch: (value: boolean) => void;
   provider: { calls: string[]; mode: 'normal' | 'fail' };
 }) {
-  const { origin, workspace, otherWorkspace, owner, peer, account, otherAccount, pin, setUser, setHead, setRevoked, setTree, share, provider } = fixture;
+  const { origin, workspace, otherWorkspace, owner, peer, account, otherAccount, pin, setDeleted, setUser, setHead, setRevoked, setTree, share, provider, sent, setMismatch } = fixture;
   const studio = require('../src/app/api/studio/route') as typeof import('../src/app/api/studio/route');
   const svc = require('../src/lib/studio/service') as typeof import('../src/lib/studio/service');
   const { studioEvidenceTool, studioDraftTool } = require('../src/lib/agents/tools/studio') as typeof import('../src/lib/agents/tools/studio');
@@ -16,7 +18,7 @@ export async function testWebsiteStudio(sql: postgres.Sql, check: (label: string
   const queue = require('../src/lib/jobs/queue') as typeof import('../src/lib/jobs/queue');
   const { executeJob } = require('../worker/job-executor') as typeof import('../worker/job-executor');
   const selection = { installation: '71', installationPage: 1, repo: '81', repoPage: 1 };
-  const registration = { action: 'register', account, selection, name: 'Studio fixture' };
+  const registration = { action: 'register', account, selection, name: 'Studio fixture', branch: 'main' };
   const base = `${origin}/api/studio?workspace=${workspace}`;
   const get = (id?: string) => studio.GET(new Request(id ? `${base}&project=${id}` : base));
   const post = (data: object, source = origin) => studio.POST(new Request(base, { method: 'POST', headers: { Origin: source }, body: JSON.stringify(data) }));
@@ -52,7 +54,7 @@ export async function testWebsiteStudio(sql: postgres.Sql, check: (label: string
   check('Studio accepts a pinned Hub grant for the exact public file', (await share(true)).ok && (await studioEvidenceTool.execute({ projectId: project }, evidenceCtx)).success);
   const plan = { title: 'Improve architecture text', objective: 'Clarify architecture notes while preserving the original objective.',
     path: 'README.md', reason: 'Make system overview easier to read', outcome: 'Clear architecture notes', risk: 'low', complexity: 'small', criteria: 'Review the prose' };
-  const makePlan = (change: object = {}) => post({ action: 'plan', project, plan: { ...plan, ...change } });
+  const makePlan = (change: object = {}) => post({ action: 'plan', project, version: 1, sha: pin, plan: { ...plan, ...change } });
   check('Studio rejects empty or unsafe plans', (await makePlan({ objective: '' })).status === 400 && (await makePlan({ path: '../README.md' })).status === 422 && (await makePlan({ objective: 'password="fixtureNotARealCredential123"' })).status === 422);
   check('Studio saves an evidence-linked plan without starting a job', (await makePlan()).ok && (await sql`select job_id from studio_work where project_id=${project}`)[0]?.job_id === null);
   const first = (await (await get(project)).json()).work[0].item;
@@ -117,6 +119,62 @@ export async function testWebsiteStudio(sql: postgres.Sql, check: (label: string
   provider.mode = 'normal';
   check('Studio reports a provider failure without fabricating a draft', failed?.outcome === 'failed' &&
     (await sql`select change from studio_work where id=${second.id}`)[0]?.change === null);
+  (require('../src/lib/security/rate-limit') as typeof import('../src/lib/security/rate-limit')).resetRateLimits();
+  const branchView = (query: string, id = project) => studio.GET(new Request(`${base}&project=${id}&view=branches${query}`));
+  const roster = await (await branchView('')).json();
+  const lookup = await (await branchView('&branch=feature%2Fredesign')).json();
+  const comparison = await studio.GET(new Request(`${base}&project=${project}&view=compare&base=main&head=staging`));
+  check('Studio lists real branch SHAs, labels default, resolves slash refs and compares exact commits', roster.items.some(
+    (item: { name: string; sha: string; isDefault: boolean }) => item.name === 'main' && item.sha === pin && item.isDefault) && lookup.items[0]?.name === 'feature/redesign' &&
+    comparison.ok && (await comparison.json()).comparison.ahead_by === 1);
+  check('Studio rejects branch syntax and unavailable branches', (await branchView('&branch=main%2F..')).status === 400 && (await branchView('&branch=missing')).status === 404);
+  setUser(peer);
+  check('Studio branch discovery denies a different workspace member', (await branchView('')).status === 404);
+  setUser(owner);
+  const staging = await post({ ...registration, name: 'Studio staging fixture', branch: 'staging' });
+  const secondary = (await staging.json()).project;
+  check('Studio can register two branches of one repository as separate projects', staging.status === 201 && secondary !== project &&
+    (await (await get(secondary)).json()).currentSha === 'a'.repeat(40));
+  const switchTo = (branch: string, version: number, acknowledge = false) => post({ action: 'switch_branch', project, version, branch, acknowledge });
+  check('Studio branch switching rejects duplicate repository plus branch', (await switchTo('staging', 1)).status === 409);
+  setDeleted(true);
+  const deleted = await (await get(secondary)).json();
+  check('Studio reports deleted branch without falling back to default head', deleted.branchUnavailable && deleted.currentSha === null && deleted.site.workingBranch === 'staging');
+  setDeleted(false);
+  await sql`update studio_work set review=null where id=${first.id}`;
+  check('Studio branch switching requires warning acknowledgement for unreviewed changes', (await switchTo('feature/redesign', 1)).status === 409);
+  const switched = await switchTo('feature/redesign', 1, true);
+  const branchDetail = await (await get(project)).json();
+  check('Studio does not reuse a report or an approval across branches even at the same SHA', switched.ok && branchDetail.currentSha === pin &&
+    branchDetail.report === null && branchDetail.history.some((entry: { branch: string }) => entry.branch === 'main') && branchDetail.work.length === 2 &&
+    (await makePlan()).status === 409 && (await review(saved!.change_digest)).status === 409);
+  check('Studio switches with version fencing and can analyze the newly selected branch', (await switchTo('main', 1, true)).status === 409 &&
+    (await post({ action: 'analyze', project })).ok && (await (await get(project)).json()).report.commitSha === pin);
+  setTree('execute');
+  const runBody = { action: 'execute', project, version: 2, sha: pin, mode: 'preview' };
+  check('Studio rejects a stale source selection and an unapproved digest before dispatch', (await post({ ...runBody, version: 1 })).status === 409 &&
+    (await post({ ...runBody, work: first.id, digest: saved!.change_digest })).status === 409 && sent.length === 0);
+  const requested = await post(runBody);
+  const { execution } = await requested.json();
+  check('Studio dispatches exactly one branch-and-commit-bound source snapshot without tokens', requested.status === 202 && sent.length === 1 &&
+    sent[0]?.branch === 'feature/redesign' && sent[0]?.commit === pin && !!sent[0]?.files[0]?.text.includes('Exact source fixture') &&
+    !JSON.stringify(sent[0]).includes('encryptedToken'));
+  if (execution) {
+    check('Studio blocks switching and duplicate starts during active verification', (await switchTo('main', 2, true)).status === 409 && (await post(runBody)).status === 409);
+    const readRun = (id = project) => studio.GET(new Request(`${base}&project=${id}&view=execution&execution=${execution}`));
+    setMismatch(true);
+    check('Studio rejects mismatched remote receipt provenance', (await readRun()).status === 502);
+    setMismatch(false);
+    setUser(peer);
+    check('Studio does not expose execution or preview to a different member', (await readRun()).status === 404);
+    setUser(owner);
+    check('Studio rejects a run ID in another owned project and exposes the preview only on its owner scope', (await readRun(secondary)).status === 404 &&
+      !!(await (await readRun()).json()).result?.preview?.url?.startsWith('https://preview.example.test/p/'));
+    const stopped = await post({ action: 'stop_execution', project, execution });
+    check('Studio persists the remote stop and removes the preview URL', stopped.ok && (await stopped.json()).state === 'cancelled' &&
+      !(await (await get(project)).json()).executions[0]?.result?.preview);
+  }
+  setTree('normal');
   // Cancelling/revoking is intentionally a server-side policy, not a browser-only button.
   check('Studio denies direct cross-project work calls', !(await svc.studioJobWork(actor, workspace, job).then(() => true, () => false)));
 }

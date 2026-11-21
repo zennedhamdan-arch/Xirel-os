@@ -5,7 +5,7 @@ import { join, resolve, isAbsolute } from 'node:path';
 import { mkdtemp, mkdir, opendir, rm, writeFile, realpath, stat } from 'node:fs/promises';
 import { assertProjectRoot, readProjectFile, validComponent } from './files';
 
-export const presets = ['test', 'build', 'node-test'] as const;
+export const presets = ['test', 'build', 'lint', 'typecheck', 'test:integration', 'node-test'] as const;
 export type Preset = typeof presets[number];
 
 export function namespaceRunnerEnabled() {
@@ -13,13 +13,13 @@ export function namespaceRunnerEnabled() {
 }
 
 /** Fail closed: no direct command execution if namespaces, mounts, chroot or resource caps fail. */
-export async function runProjectPreset(root: string, preset: Preset, signal?: AbortSignal) {
+export async function runProjectPreset(root: string, preset: Preset, signal?: AbortSignal, options?: { approvedManifest: string | null; modules: string | null }) {
   if (!namespaceRunnerEnabled()) throw new Error('Linux namespace runner is not enabled on this host');
   if (!presets.includes(preset)) throw new Error('Command is not an approved preset');
-  const configuredPresets = (process.env.AGENT_EXEC_PRESETS ?? '').split(',').map(s => s.trim());
+  const configuredPresets = options ? presets : (process.env.AGENT_EXEC_PRESETS ?? '').split(',').map(s => s.trim());
   if (!configuredPresets.includes(preset)) throw new Error('Preset is not configured');
   const project = await assertProjectRoot(root);
-  const modules = process.env.AGENT_EXEC_MODULES;
+  const modules = options ? options.modules : process.env.AGENT_EXEC_MODULES;
   if (modules && (!isAbsolute(modules) || await realpath(modules) !== resolve(modules) || !(await stat(modules)).isDirectory())) throw new Error('Dependency root is not trusted');
   const work = await mkdtemp(join(tmpdir(), 'xirel-isolate-'));
   const snapshot = join(work, 'project');
@@ -47,7 +47,7 @@ export async function runProjectPreset(root: string, preset: Preset, signal?: Ab
     }
     await copy('', snapshot, 0);
     if (preset !== 'node-test') {
-      const expected = process.env.AGENT_EXEC_PACKAGE_SHA256;
+      const expected = options ? options.approvedManifest : process.env.AGENT_EXEC_PACKAGE_SHA256;
       const manifest = await readProjectFile(snapshot, 'package.json');
       if (!expected || manifest.sha256 !== expected) throw new Error('Package scripts are not approved for this snapshot');
     }
