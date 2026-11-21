@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowLeft, ArrowUpRight, BookOpen, FileCode2, Folder, GitBranch, GitCommitHorizontal, GitPullRequest, Plus, RefreshCw, Search, ShieldCheck } from 'lucide-react';
 import type { RepoSelection, RepoView } from '@/lib/github-hub/github';
@@ -168,6 +169,8 @@ export default function Hub({ workspace, installUrl }: { workspace: string; inst
           {view === 'commit' && <button className={button} type="button" onClick={() => show('commits')}><ArrowLeft size={15} /> Recent commits</button>}
           <Result ready={!!explorer.data} error={explorer.error}>
             {explorer.data && <>
+              {explorer.data.kind === 'overview' && <Link className={button} href={`/studio?${new URLSearchParams({ workspace, account,
+                installation: selection.installation, installationPage: String(selection.installationPage), repo: selection.repo, repoPage: String(selection.repoPage) })}`}>Open in Website Studio</Link>}
               <ExplorerContent data={explorer.data} selectFile={p => show('files', p)} selectCommit={s => show('commit', '', s)} />
               {'hasNext' in explorer.data && <Pager label="Explorer pages" page={page} next={!!explorer.data.hasNext} set={setPage} />}
               {explorer.data.kind === 'overview' && (accounts.data?.aiEnabled || explorer.data.share) &&

@@ -1,3 +1,4 @@
+import { studioToolName } from '@/lib/studio/types';
 import 'server-only';
 import type { AiMessage, AiProviderId } from '@/lib/ai/types';
 import { getProject, getProjectSummary } from '@/lib/projects/queries';
@@ -19,6 +20,7 @@ export interface AgentTurnRequest {
   history: AiMessage[];
   providerPriority: AiProviderId[];
   signal?: AbortSignal;
+  studioJobId?: string;
   checkActive?: () => Promise<void>;
   beforeWrite?: () => Promise<void>;
   onRunCreated?: (runId: string) => Promise<void>;
@@ -40,7 +42,7 @@ export interface AgentTurnResult {
   providerId: AiProviderId | null;
   iterations: number;
   projectId: string | null;
-  planSource: 'model' | 'deterministic_fallback' | 'skipped';
+  planSource: 'model' | 'deterministic_fallback' | 'approved_studio' | 'skipped';
   verification: VerificationReport;
   error: string | null;
   providerFailure?: ClassifiedError;
@@ -94,7 +96,8 @@ export async function runAgentTurn(request: AgentTurnRequest): Promise<AgentTurn
     await updateRunStatus(run.id, 'planning', { currentStep: 'Planning' });
     const summary = request.projectId ? await getProjectSummary(workspaceId, request.projectId) : null;
     if (request.projectId && !summary) throw new Error('Project not found in workspace');
-    let memory = summary?.memory ?? [];
+    // Studio only shares its exact approved source. Shared workspace memory has a separate policy.
+    let memory = request.studioJobId ? [] : summary?.memory ?? [];
     if (rank[role] >= rank.admin && memory.length > 1 && process.env.OPENROUTER_RETRIEVAL_WORKSPACE_ID === workspaceId) {
       try {
         if (process.env.OPENROUTER_RERANK_MODEL === OPENROUTER_SELECTED_MODELS.rerank) {
@@ -111,15 +114,17 @@ export async function runAgentTurn(request: AgentTurnRequest): Promise<AgentTurn
         }
       } catch { await addEvent({ runId: run.id, workspaceId, eventType: 'retrieval_unavailable', message: 'Using recent project memory.' }); }
     }
-    const context = summary ? JSON.stringify({
+    const context = summary && !request.studioJobId ? JSON.stringify({
       id: summary.project.id, name: summary.project.name, description: summary.project.description,
       memory: memory.map(m => ({ kind: m.kind, key: m.key, text: m.content.slice(0, 500),
         recordedAt: m.updatedAt, source: m.metadata?.source ?? 'unspecified' })),
       recentTasks: summary.recentTasks,
     }).slice(0, 9_000) : '';
     await check();
-    const tools = getAllTools(workspaceId, request.projectId, !!request.beforeWrite).filter(tool => rank[role] >= rank[tool.requiredPermission]).map(tool => tool.name);
-    const outcome = await generatePlan({ runId: run.id, workspaceId, message, history, providerPriority,
+    const tools = getAllTools(workspaceId, request.projectId, !!request.beforeWrite, request.studioJobId).filter(tool => rank[role] >= rank[tool.requiredPermission]).map(tool => tool.name);
+    const outcome = request.studioJobId ? { source: 'approved_studio' as const, plan: { steps: [{
+      description: 'Read the exact approved source and save a single inert replacement for human review.', toolHint: studioToolName,
+    }] } } : await generatePlan({ runId: run.id, workspaceId, message, history, providerPriority,
       projectContext: context, toolNames: tools, signal });
     const { plan } = outcome;
     result.planSource = outcome.source;
@@ -136,7 +141,7 @@ export async function runAgentTurn(request: AgentTurnRequest): Promise<AgentTurn
       let failed = false;
       let presetFailed = false;
       const execution = await runOrchestrator({ workspaceId, userId, taskId, providerPriority, signal, projectId: request.projectId,
-        allowedTool: planned.toolHint ?? undefined, checkActive: check,
+        allowedTool: planned.toolHint ?? undefined, studioJobId: request.studioJobId, checkActive: check,
         beforeWrite: request.beforeWrite ? async () => { await request.beforeWrite!(); priorWrite = true; } : undefined,
         modelByProvider: process.env.OPENROUTER_TOOL_MODEL ? { openrouter: process.env.OPENROUTER_TOOL_MODEL } : undefined,
         consumeApproval: request.consumeApproval,
@@ -201,7 +206,7 @@ export async function runAgentTurn(request: AgentTurnRequest): Promise<AgentTurn
       if (execution.exhausted || failed || presetFailed || !execution.text.trim() || (planned.toolHint && !successes.has(planned.toolHint))) {
         throw new Error('Plan step ended without the required result');
       }
-      outputs.push(execution.text.slice(0, 6_000));
+      outputs.push(request.studioJobId ? 'Draft execution finished. See the stored artifact in Website Studio. Build, preview and publishing were not run.' : execution.text.slice(0, 6_000));
       await finishStep(record.id, 'completed', { output: { text: outputs.at(-1), tools: [...successes] } });
     }
     if (result.status !== 'waiting_for_approval') {

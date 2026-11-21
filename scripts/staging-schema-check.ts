@@ -12,11 +12,17 @@ export async function checkStagingSchema(connection: postgres.Sql, expectedWorke
     await sql`select id, run_id, output from public.agent_steps limit 0`;
     await sql`select id, run_id, success from public.tool_executions limit 0`;
     await sql`select id from public.bos_customers limit 0`;
+    await sql`select workspace_id, user_id, account_id, head from public.studio_sites limit 0`;
+    await sql`select project_id, commit_sha, profile from public.studio_reports limit 0`;
+    await sql`select project_id, job_id, digest, change_digest from public.studio_work limit 0`;
     const [row] = await sql`select
       (select ssl from pg_stat_ssl where pid=pg_backend_pid()) as tls,
       has_table_privilege(current_user,'public.worker_heartbeats','INSERT') and has_table_privilege(current_user,'public.worker_heartbeats','UPDATE') and
       has_table_privilege(current_user,'public.agent_jobs','INSERT') and has_table_privilege(current_user,'public.agent_jobs','UPDATE') and
       has_table_privilege(current_user,'public.agent_approvals','UPDATE') and has_table_privilege(current_user,'public.tool_executions','INSERT') as worker_grants,
+      not has_table_privilege('authenticated','public.studio_sites','SELECT') and
+      not has_table_privilege('authenticated','public.studio_reports','SELECT') and
+      not has_table_privilege('authenticated','public.studio_work','UPDATE') and
       not has_table_privilege('authenticated','public.agent_jobs','SELECT') and
       not has_table_privilege('authenticated','public.agent_approvals','UPDATE') and
       not has_table_privilege('authenticated','public.messages','INSERT') as browser_fenced`;

@@ -1,3 +1,4 @@
+import { studioJobType } from '@/lib/studio/types';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { canManageOwnedResource, isUuid, requireUser, requireWorkspaceAccess } from '@/lib/api/guards';
@@ -49,6 +50,7 @@ export async function POST(
   }
 
   if (parsed.data.action === 'retry') {
+    if (job.taskType === studioJobType) return NextResponse.json({ error: 'Create and approve a new plan in Website Studio.' }, { status: 409 });
     if (job.status !== 'failed' || job.checkpoint?.writeAttempt != null) {
       return NextResponse.json({ error: 'Only failed jobs without interrupted writes can be retried' }, { status: 409 });
     }

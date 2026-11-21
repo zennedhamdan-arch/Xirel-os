@@ -1,3 +1,4 @@
+import { studioToolName } from '@/lib/studio/types';
 import 'server-only';
 import { db } from '@/lib/db';
 import { workspaceMembers, toolExecutions } from '@/lib/db/schema';
@@ -54,6 +55,7 @@ export interface OrchestratorRunRequest {
   signal?: AbortSignal;
   projectId?: string | null;
   allowedTool?: string;
+  studioJobId?: string;
   checkActive?: () => Promise<void>;
   beforeWrite?: () => Promise<void>;
   consumeApproval?: (tool: string, args: Record<string, unknown>) => Promise<boolean>;
@@ -137,6 +139,7 @@ async function executeToolCall(
     projectId?: string | null;
     signal?: AbortSignal;
     runId?: string | null;
+    studioJobId?: string;
     beforeWrite?: () => Promise<void>;
     consumeApproval?: OrchestratorRunRequest['consumeApproval'];
   },
@@ -281,7 +284,7 @@ export async function runOrchestrator(
     throw new Error('runOrchestrator: providerPriority was empty — no provider to route to.');
   }
 
-  const availableTools = getAllTools(request.workspaceId, request.projectId, !!request.beforeWrite).filter((t) => hasPermission(userRole, t.requiredPermission) && (!request.allowedTool || request.allowedTool === t.name));
+  const availableTools = getAllTools(request.workspaceId, request.projectId, !!request.beforeWrite, request.studioJobId).filter((t) => hasPermission(userRole, t.requiredPermission) && (!request.allowedTool || request.allowedTool === t.name));
   const aiTools = toAiToolDefinitions(availableTools);
 
   const conversation: AiMessage[] = [...request.messages];
@@ -289,6 +292,7 @@ export async function runOrchestrator(
   const hooks = request.hooks;
   let lastProviderId: AiProviderId = primaryProvider;
 
+  let studioSourceRead = false;
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
     if (hooks?.onTurnStart) {
       try {
@@ -353,12 +357,14 @@ export async function runOrchestrator(
       await request.checkActive?.();
       const currentRole = await getWorkspaceRole(request.workspaceId, request.userId);
       if (!currentRole || currentRole === 'viewer') throw new Error('Workspace execution permission was revoked');
-      const resultJson = availableTools.some(t => t.name === call.name)
+      const replaceBeforeRead = request.studioJobId && call.name === studioToolName && call.arguments.operation === 'replace' && !studioSourceRead;
+      const resultJson = !replaceBeforeRead && availableTools.some(t => t.name === call.name)
         ? await executeToolCall(call, { workspaceId: request.workspaceId, userId: request.userId,
-          taskId: request.taskId, projectId: request.projectId, signal: request.signal, runId: hooks?.runId, beforeWrite: request.beforeWrite,
+          taskId: request.taskId, projectId: request.projectId, signal: request.signal, studioJobId: request.studioJobId, runId: hooks?.runId, beforeWrite: request.beforeWrite,
           consumeApproval: request.consumeApproval }, currentRole)
         : JSON.stringify({ success: false, error: 'Tool is not available for this step' });
       const result = JSON.parse(resultJson) as { success?: boolean; approval_required?: boolean };
+      if (request.studioJobId && call.name === studioToolName && call.arguments.operation === 'read' && result.success) studioSourceRead = true;
       await hooks?.onToolExecuted?.(call, resultJson, result.success === true);
       if (result.approval_required || (!result.success && call.name !== 'project_command' && call.name !== 'web_read_page')) {
         return { text: result.approval_required ? 'Waiting for approval.' : 'A tool failed.', newMessages,

@@ -16,7 +16,7 @@ import { getSafeAuthRedirect, loginUrl } from '@/lib/auth/redirect';
  */
 export async function middleware(request: NextRequest) {
   const { pathname, search, searchParams } = request.nextUrl;
-  const protectedPage = (['dashboard', 'onboarding', 'command', 'chat', 'github'] as const).find(
+  const protectedPage = (['dashboard', 'onboarding', 'command', 'chat', 'github', 'studio'] as const).find(
     page => pathname === `/${page}` || pathname.startsWith(`/${page}/`),
   );
   const isAuthRoute = pathname === '/login' || pathname === '/login/';

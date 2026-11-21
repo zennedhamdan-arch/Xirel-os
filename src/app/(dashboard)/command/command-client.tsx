@@ -117,7 +117,7 @@ function Card({ title, children, action }: { title: string; children: React.Reac
   );
 }
 
-export default function CommandClient({ workspaceId }: { workspaceId: string }) {
+export default function CommandClient({ workspaceId, initialProject = '' }: { workspaceId: string; initialProject?: string }) {
   const [jobs, setJobs] = useState<JobSummary[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
   const [runs, setRuns] = useState<RunRow[]>([]);
@@ -131,7 +131,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
   const [chatTask, setChatTask] = useState<string | null>(null);
   const [turns, setTurns] = useState<{ role: string; text: string }[]>([]);
   const [projects, setProjects] = useState<ProjectRow[]>([]);
-  const [projectId, setProjectId] = useState('');
+  const [projectId, setProjectId] = useState(initialProject);
   const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
   const [projectDraft, setProjectDraft] = useState('');
   const [memoryKey, setMemoryKey] = useState('');
@@ -394,6 +394,7 @@ export default function CommandClient({ workspaceId }: { workspaceId: string }) 
             <Link className="hover:text-slate-100" href="/chat">Chat</Link>
             <Link className="hover:text-slate-100" href="/dashboard">Dashboard</Link>
             <Link className="hover:text-slate-100" href={`/github?workspace=${workspaceId}`}>GitHub Hub</Link>
+            <Link className="hover:text-slate-100" href={`/studio?workspace=${workspaceId}`}>Website Studio</Link>
             <Link className="hover:text-slate-100" href="/business">Business OS</Link>
           </nav>
         </header>

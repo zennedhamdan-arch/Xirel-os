@@ -41,6 +41,7 @@ export interface ToolExecutionContext {
   taskId: string;
   projectId?: string | null;
   signal?: AbortSignal;
+  studioJobId?: string;
 }
 
 export interface ToolResult<TOutput = unknown> {

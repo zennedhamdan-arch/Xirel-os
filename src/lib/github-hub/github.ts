@@ -227,10 +227,31 @@ export async function readPinnedFile(token: string, repo: HubRepo, pin: string, 
     if (i < segments.length - 1 && selected?.type === 'tree') { treeSha = selected.sha; continue; }
     if (i === segments.length - 1 && selected?.type === 'blob' && ['100644', '100755'].includes(selected.mode)) {
       const file = blob.parse(await request(`${root}/git/blobs/${selected.sha}`, token, {}, signal));
+      if (file.sha !== selected.sha) throw new HubError(502, 'GitHub returned a different blob than requested.');
       return { path, pin, sha: file.sha, sourceUrl: `https://github.com/${repo.owner.login}/${repo.name}/blob/${pin}/${path.split('/').map(encodeURIComponent).join('/')}`,
         untrustedText: decodeText(file) };
     }
     throw new HubError(404, 'The shared path is not a regular file at this commit.');
   }
   throw new HubError(404, 'The shared path was not found.');
+}
+
+/** Studio calls only after verifying the actor's installation and repository roster. */
+export async function studioHead(token: string, repo: HubRepo, signal?: AbortSignal) {
+  const branch = z.object({ commit: z.object({ sha: shaSchema }) }).parse(await request(
+    `${pathFor(repo)}/branches/${encodeURIComponent(repo.default_branch)}`, token, {}, signal));
+  return branch.commit.sha;
+}
+
+export async function studioTree(token: string, repo: HubRepo, sha: string, signal?: AbortSignal) {
+  const root = pathFor(repo);
+  const { tree: commitTreeEntry } = commitTree.parse(await request(`${root}/git/commits/${shaSchema.parse(sha)}`, token, {}, signal));
+  try {
+    const result = tree.parse(await request(`${root}/git/trees/${commitTreeEntry.sha}`, token, { recursive: '1' }, signal));
+    return { items: result.tree.slice(0, 1200), limited: result.truncated || result.tree.length > 1200 };
+  } catch (error) {
+    if (!(error instanceof HubError) || error.status !== 502 || signal?.aborted) throw error;
+    const result = tree.parse(await request(`${root}/git/trees/${commitTreeEntry.sha}`, token, {}, signal));
+    return { items: result.tree.slice(0, 1200), limited: true };
+  }
 }

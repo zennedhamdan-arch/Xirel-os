@@ -51,6 +51,15 @@ try {
   const hubApi = await request('/api/github-hub?workspace=10000000-1000-4000-8000-000000000000');
   assert.equal(hubApi.status, 401);
   await hubApi.body?.cancel();
+  const studioTarget = '/studio?workspace=10000000-1000-4000-8000-000000000000';
+  const studio = await request(studioTarget);
+  assert.equal(studio.status, 307);
+  assert.equal(new URL(studio.headers.get('location')).searchParams.get('redirectTo'), studioTarget);
+  await studio.body?.cancel();
+  const studioApi = await request(`/api${studioTarget}`);
+  assert.equal(studioApi.status, 401);
+  assert.match(studioApi.headers.get('cache-control') ?? '', /no-store/);
+  await studioApi.body?.cancel();
   const badCallback = await request(`/api/auth/callback?${new URLSearchParams({ error: 'access_denied', redirectTo: retiredOrigin })}`, forged);
   assert.equal(badCallback.status, 307);
   const failure = new URL(badCallback.headers.get('location'));

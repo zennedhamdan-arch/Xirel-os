@@ -1,3 +1,4 @@
+import { studioJobType } from '@/lib/studio/types';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { and, desc, eq } from 'drizzle-orm';
@@ -15,7 +16,7 @@ const createSchema = z.object({
   instructions: z.string().min(1).max(8000),
   cron: z.string().min(9).max(100),
   projectId: z.string().uuid().optional(),
-  taskType: z.string().max(60).optional(),
+  taskType: z.string().max(60).refine(value => value !== studioJobType).optional(),
 });
 
 /**

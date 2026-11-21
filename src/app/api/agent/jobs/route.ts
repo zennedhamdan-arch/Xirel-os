@@ -1,3 +1,4 @@
+import { studioJobType } from '@/lib/studio/types';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { projectBelongsToWorkspace, requireWorkspaceAccess } from '@/lib/api/guards';
@@ -12,7 +13,7 @@ const submitSchema = z.object({
   workspaceId: z.string().uuid(),
   description: z.string().min(1).max(8000),
   title: z.string().min(1).max(200).optional(),
-  taskType: z.string().max(60).optional(),
+  taskType: z.string().max(60).refine(value => value !== studioJobType).optional(),
   projectId: z.string().uuid().optional(),
   priority: z.number().int().min(-100).max(100).optional(),
   maxAttempts: z.number().int().min(1).max(10).optional(),

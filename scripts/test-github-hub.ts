@@ -4,6 +4,8 @@ import Module from 'node:module';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { NextRequest } from 'next/server';
 import type postgres from 'postgres';
+import { testWebsiteStudio } from './test-website-studio';
+import type { AiRequest } from '../src/lib/ai/types';
 import * as schema from '../src/lib/db/schema';
 
 type Check = (label: string, ok: boolean) => void;
@@ -33,8 +35,19 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
   const realFetch = globalThis.fetch;
   const db = drizzle(sql, { schema });
   let user = ids.user;
+  const provider = { calls: [] as string[], mode: 'normal' as 'normal' | 'fail' };
+  const generate = async (request: AiRequest) => {
+    provider.calls.push(JSON.stringify(request));
+    if (provider.mode === 'fail') throw new Error('fixture provider unavailable');
+    const operation = request.messages.filter(m => m.role === 'tool').length;
+    const name = 'website_studio_draft';
+    return operation < 2 ? { providerId: 'gemini', text: '', finishReason: 'tool_calls', toolCalls: [{ id: `studio-${operation}`, name,
+      arguments: operation === 0 ? { operation: 'read' } : { operation: 'replace', replacement: 'Updated architecture notes.\n', explanation: 'Clarified the notes.' } }] }
+      : { providerId: 'gemini', text: 'Draft saved for review.', finishReason: 'stop', toolCalls: [] };
+  };
   loader._load = (name, ...args) => {
     if (name === 'server-only') return {};
+    if (name === '@/lib/ai/router') return { routeGenerateText: generate };
     if (name === '@/lib/db') return { db };
     if (name === '@/lib/auth/supabase-server') return { createSupabaseServerClient: async () => ({ auth: { getUser: async () => ({ data: { user: { id: user } } }) } }) };
     return actual.call(Module, name, ...args);
@@ -47,6 +60,8 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
   let repoApiError = false;
   let installationPages: ((page: number) => unknown) | null = null;
   let revokedRepo = false;
+  let head = pin;
+  let studioTree: 'normal' | 'large' | 'malformed' = 'normal';
   let unsafeFile = false;
   let issueTransport = false;
   const routes: { token: string; path: string; page: number }[] = [];
@@ -81,8 +96,20 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
     if (path === '/user/installations/72/repositories' && token === bToken) return Response.json({ total_count: 1, repositories: [repo(91, 'team', 'internal-repo', true)] });
     if (path.startsWith('/repos/alice/personal') && token === aToken) {
       downstream++;
-      if (path.endsWith(`/git/commits/${pin}`)) return Response.json({ tree: { sha: tree } });
-      if (path.endsWith(`/git/trees/${tree}`)) return Response.json({ truncated: false, tree: [{ path: 'README.md', mode: '100644', type: 'blob', sha: blob }] });
+      if (path.endsWith('/branches/main')) return Response.json({ commit: { sha: head } });
+      if (path.endsWith(`/git/commits/${pin}`) || path.endsWith(`/git/commits/${'a'.repeat(40)}`)) return Response.json({ tree: { sha: tree } });
+      if (path.endsWith(`/git/trees/${tree}`)) {
+        if (studioTree === 'malformed') return Response.json({ unexpected: true });
+        const files = [{ path: 'README.md', mode: '100644', type: 'blob', sha: blob }];
+        if (studioTree === 'large') files.push({ path: 'package.json', mode: '100644', type: 'blob', sha: '1'.repeat(40) },
+          { path: 'index.html', mode: '100644', type: 'blob', sha: '2'.repeat(40) }, { path: '.env', mode: '100644', type: 'blob', sha: '3'.repeat(40) },
+          { path: 'symlink.html', mode: '120000', type: 'blob', sha: blob });
+        return Response.json({ truncated: studioTree === 'large' && url.searchParams.has('recursive'), tree: files });
+      }
+      for (const [sha, body] of [['1'.repeat(40), '{"dependencies":{"next":"^15"},"scripts":{"build":"next build"}}'],
+        ['2'.repeat(40), '<html><head></head><body>Fixture website</body></html>']]) {
+        if (path.endsWith(`/git/blobs/${sha}`)) return Response.json({ content: Buffer.from(body!).toString('base64'), size: body!.length, sha, encoding: 'base64' });
+      }
       if (path.endsWith(`/git/blobs/${blob}`)) {
         const bytes = Buffer.from(unsafeFile ? `password=${aToken}` : 'Architecture notes from repository fixture.');
         return Response.json({ content: bytes.toString('base64'), size: bytes.length, sha: blob, encoding: 'base64' });
@@ -253,6 +280,10 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
     check('GitHub Hub agent discovers by description and reads only an explicitly shared pinned file', found.success && JSON.stringify(found).includes('alice/personal') &&
       result.success && JSON.stringify(result).includes('Architecture notes') && JSON.stringify(result).includes(`/blob/${pin}/README.md`) &&
       !(await githubHubTool.execute({ ...file, path: 'other.txt' }, ctx)).success && !(await githubHubTool.execute(file, { ...ctx, userId: ids.peer })).success);
+    await post({ ...share, enabled: false });
+    await testWebsiteStudio(sql, check, { origin, workspace: ids.workspace, otherWorkspace: ids.otherWorkspace, owner: ids.user, peer: ids.peer,
+      account: a, otherAccount: b, pin, setUser: id => { user = id; }, setHead: commit => { head = commit; }, setTree: variant => { studioTree = variant; },
+      setRevoked: value => { revokedRepo = value; }, share: enabled => post({ ...share, enabled }), provider });
     process.env.GITHUB_HUB_AI_ENABLED = 'false';
     check('GitHub Hub AI deployment switch denies reads and new grants even for an authorized account', !(await githubHubTool.execute(file, ctx)).success &&
       (await post(share)).status === 403 && (await get({ view: 'overview', account: a, ...selection })).ok);
@@ -273,7 +304,7 @@ export async function testGitHubHub(sql: postgres.Sql, check: Check, ids: { user
       /agent_file/.test(audit!.operations) && ![aToken, bToken, appSecret, 'fixture-refresh-token'].some(needle => payloads.join('').includes(needle) || JSON.stringify(audit).includes(needle)));
   } finally {
     loader._load = actual; globalThis.fetch = realFetch;
-    for (const name of Object.keys(require.cache)) if (!before.has(name) && name.includes('/src/')) delete require.cache[name];
+    for (const name of Object.keys(require.cache)) if (!before.has(name) && (name.includes('/src/') || name.includes('/worker/'))) delete require.cache[name];
     for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   }
 }

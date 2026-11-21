@@ -4,6 +4,7 @@ import { loginUrl } from '@/lib/auth/redirect';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
 import { db } from '@/lib/db';
 import { workspaceMembers } from '@/lib/db/schema';
+import { listSites } from '@/lib/studio/service';
 import { and, eq } from 'drizzle-orm';
 import { isCommandSetupComplete } from '@/lib/db/setup-check';
 import { isUuid } from '@/lib/api/guards';
@@ -18,7 +19,7 @@ import CommandClient from './command-client';
 export default async function CommandPage({
   searchParams,
 }: {
-  searchParams: Promise<{ workspace?: string }>;
+  searchParams: Promise<{ workspace?: string; project?: string }>;
 }) {
   const supabase = await createSupabaseServerClient();
   const {
@@ -60,5 +61,7 @@ export default async function CommandPage({
     );
   }
 
-  return <CommandClient key={workspaceId} workspaceId={workspaceId} />;
+  const { project } = await searchParams;
+  const initialProject = isUuid(project) && (await listSites({ workspaceId, userId: user.id }).catch(() => [])).some(site => site.projectId === project && !site.archived) ? project : '';
+  return <CommandClient key={`${workspaceId}:${initialProject}`} workspaceId={workspaceId} initialProject={initialProject} />;
 }
