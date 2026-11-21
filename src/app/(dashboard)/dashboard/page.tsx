@@ -5,9 +5,8 @@ import { getAppOrigin } from '@/lib/auth/app-origin';
 import { loginUrl } from '@/lib/auth/redirect';
 import Link from 'next/link';
 import { createSupabaseServerClient } from '@/lib/auth/supabase-server';
-import { db } from '@/lib/db';
-import { workspaceMembers, workspaces } from '@/lib/db/schema';
-import { eq } from 'drizzle-orm';
+import { safeDatabaseErrorCode } from '@/lib/db/safe-error';
+import { getDashboardMemberships } from '@/lib/workspaces/dashboard-memberships';
 import { getConfiguredProviders } from '@/lib/ai/config';
 import SignOutButton from './sign-out-button';
 
@@ -29,11 +28,24 @@ export default async function DashboardPage() {
     redirect(loginUrl(getAppOrigin(), '/dashboard').href);
   }
 
-  const memberships = await db
-    .select({ workspace: workspaces })
-    .from(workspaceMembers)
-    .innerJoin(workspaces, eq(workspaces.id, workspaceMembers.workspaceId))
-    .where(eq(workspaceMembers.userId, user.id));
+  let memberships: Awaited<ReturnType<typeof getDashboardMemberships>>;
+  try {
+    memberships = await getDashboardMemberships(user.id);
+  } catch (databaseError) {
+    console.error(JSON.stringify({ scope: 'xirel_db', operation: 'dashboard_workspace_lookup', outcome: 'failed',
+      code: safeDatabaseErrorCode(databaseError), requestId }));
+    return (
+      <main className="mx-auto max-w-3xl p-8">
+        <section aria-labelledby="workspaces-unavailable" className="rounded-xl border border-border bg-surface p-6">
+          <h1 id="workspaces-unavailable" className="text-xl font-semibold">Workspaces temporarily unavailable</h1>
+          <p className="mt-2 text-sm text-muted">You’re signed in, but we couldn’t load your workspaces. Please try again in a moment.</p>
+          <form method="get" action="/dashboard" className="mt-4">
+            <button type="submit" className="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground">Try again</button>
+          </form>
+        </section>
+      </main>
+    );
+  }
 
   if (memberships.length === 0) {
     if (tracing) authDiagnostic('dashboard', { requestId, reason: 'authenticated_user_has_no_workspace' });

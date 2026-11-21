@@ -7,7 +7,7 @@
 # manual during the safe-rollout phase.
 #
 # The worker starts independently of Next.js (worker/index.ts), connects
-# directly to Supabase Postgres via DATABASE_URL, claims durable jobs
+# to Supabase Postgres via DATABASE_URL, claims durable jobs
 # with SKIP LOCKED, and drains on SIGTERM (see worker/index.ts).
 #
 # Web is not defined in this blueprint. Stage the web app separately from
@@ -27,9 +27,8 @@ services:
     startCommand: npm run worker
     envVars:
       # ── Required: durable queue + agent runtime storage ──
-      # Supabase Postgres. On Render (long-running process) the DIRECT
-      # connection (port 5432, session pooler) is appropriate — unlike
-      # Vercel serverless, the worker holds warm connections.
+      # Use the project-issued Supabase shared session pooler (IPv4,
+      # port 5432), not the default IPv6 direct connection. See docs/render-database.md.
       - key: DATABASE_URL
         sync: false
 

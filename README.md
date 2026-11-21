@@ -63,8 +63,9 @@ npm run test:sandbox # Linux file-scope and isolated preset checks
 
 Copy `.env.example` → `.env.local` and fill in at minimum
 `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and
-`DATABASE_URL` (production must use the Supabase **transaction pooler**
-string on Vercel; the Render worker uses the direct connection).
+`DATABASE_URL`. On Render, use the provider-issued IPv4 shared pooler:
+transaction mode for the web app and session mode for a persistent worker.
+See [Render database configuration](docs/render-database.md).
 Provider keys (Gemini/OpenRouter/Groq) enable AI features — unconfigured
 providers are skipped, never faked. Render configuration lives in
 `render.yaml` (manual deploy; secrets stay in the dashboard).

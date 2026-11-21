@@ -18,7 +18,8 @@
     "test:providers": "node --conditions=react-server --import tsx scripts/staging-provider-probes.ts",
     "staging:preflight": "node --import tsx scripts/staging-preflight.ts",
     "test:staging-web": "node scripts/test-staging-web.mjs",
-    "test:auth": "tsx scripts/test-auth.ts"
+    "test:auth": "tsx scripts/test-auth.ts",
+    "probe:render-db": "node --conditions=react-server --import tsx scripts/probe-render-db.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.6.1",

@@ -430,6 +430,24 @@ async function main(): Promise<void> {
     group('7) real app routes, worker, schedules and approvals');
     await testAppIntegration(sql, check, { user: userA!.id, other: userB!.id, a: ws1!.id, b: ws2!.id, task: task1!.id });
 
+    group('7b) Render membership probe through the application client');
+    const fixturePassword = 'postgres';
+    const probe = (password: string) => spawnSync(process.execPath,
+      ['--conditions=react-server', '--import', 'tsx', 'scripts/probe-render-db.ts'], {
+        env: { ...process.env, DATABASE_URL: `postgres://postgres:${password}@localhost:${PORT}/xirel_test`,
+          DATABASE_SSL_VERIFY: 'true', NODE_EXTRA_CA_CERTS: path.join(DATA_DIR, 'server.crt'), RENDER: 'false' },
+        encoding: 'utf8', timeout: 20_000,
+      });
+    const validProbe = probe(fixturePassword);
+    check('application client verifies TLS, checks both tables and matches a real membership', validProbe.status === 0 &&
+      validProbe.stdout.includes('"workspaceMembersTable":true,"workspacesTable":true') &&
+      validProbe.stdout.includes('"outcome":"matched","peerVerification":true'));
+    const badPassword = 'never-print-this-fixture-password';
+    const failedProbe = probe(badPassword);
+    check('application client reports a sanitized auth failure without a false membership success', failedProbe.status === 1 &&
+      failedProbe.stdout.includes('"code":"28P01"') && !failedProbe.stdout.includes('"outcome":"matched"') &&
+      !(failedProbe.stdout + failedProbe.stderr).includes(badPassword));
+
     group('8) populated 0008 upgrade and worker subprocess with TLS');
     await pg.createDatabase('xirel_upgrade');
     const upgradeUrl = `postgres://postgres:postgres@localhost:${PORT}/xirel_upgrade`;
