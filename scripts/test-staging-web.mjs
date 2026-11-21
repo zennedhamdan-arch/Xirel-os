@@ -14,7 +14,7 @@ const googleEnabled = process.env.AUTH_GOOGLE_ENABLED === 'true';
 const base = `http://127.0.0.1:${port}`;
 const child = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '--hostname', '0.0.0.0', '--port', String(port)], {
   env: { PATH: process.env.PATH, NODE_ENV: 'production', NEXT_TELEMETRY_DISABLED: '1', APP_URL: expectedOrigin,
-    NEXT_PUBLIC_APP_URL: retiredOrigin, AUTH_GOOGLE_ENABLED: String(googleEnabled), NEXT_PUBLIC_SUPABASE_URL: 'https://example.invalid',
+    NEXT_PUBLIC_APP_URL: retiredOrigin, AUTH_GOOGLE_ENABLED: String(googleEnabled), AUTH_DIAGNOSTICS: 'true', NEXT_PUBLIC_SUPABASE_URL: 'https://example.invalid',
     NEXT_PUBLIC_SUPABASE_ANON_KEY: 'local-build-fixture', DATABASE_URL: 'postgres://local:local@127.0.0.1:1/local' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -49,6 +49,22 @@ try {
   assert.equal(failure.searchParams.get('redirectTo'), '/dashboard');
   assert.equal(failure.searchParams.get('error'), 'auth_callback_failed');
   await badCallback.body?.cancel();
+  // The installed SDK must reject a code without a PKCE cookie before contacting Supabase.
+  const fakeCode = 'never-log-this-fixture-code';
+  const noVerifier = await request(`/api/auth/callback?code=${fakeCode}`);
+  assert.equal(noVerifier.status, 307);
+  assert.equal(new URL(noVerifier.headers.get('location')).pathname, '/login');
+  assert.equal(noVerifier.headers.getSetCookie().length, 0);
+  await noVerifier.body?.cancel();
+  const diagnostics = () => logs.split('\n').filter(line => line.startsWith('{"scope":"xirel_auth"')).map(line => JSON.parse(line));
+  for (let i = 0; i < 20 && !diagnostics().some(e => e.errorKind === 'pkce_verifier_missing'); i++) await delay(50);
+  const missing = diagnostics().find(e => e.errorKind === 'pkce_verifier_missing');
+  assert.equal(missing?.reason, 'exchange_failed');
+  assert.equal(missing.sessionCookiesWritten, 0);
+  const arrival = diagnostics().find(e => e.event === 'callback_arrival' && e.requestId === missing.requestId);
+  assert.equal(arrival?.codePresent, true);
+  assert.equal(arrival?.pkceCookiePresent, false);
+  assert.ok(!JSON.stringify(diagnostics()).includes(fakeCode));
   const health = await request('/api/system/health?workspaceId=10000000-1000-4000-8000-000000000000');
   assert.equal(health.status, 401);
   assert.ok(!(await health.text()).includes('webRevision'));

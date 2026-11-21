@@ -1,5 +1,6 @@
 import { createServerClient, type SetAllCookies } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
+import { AUTH_REQUEST_ID, authCookieState, authDiagnostic, authDiagnosticsEnabled, safeAuthError } from '@/lib/auth/diagnostics';
 import { getAppOrigin } from '@/lib/auth/app-origin';
 import { getSafeAuthRedirect, loginUrl } from '@/lib/auth/redirect';
 
@@ -14,6 +15,16 @@ import { getSafeAuthRedirect, loginUrl } from '@/lib/auth/redirect';
  * unpredictably.
  */
 export async function middleware(request: NextRequest) {
+  const { pathname, search, searchParams } = request.nextUrl;
+  const protectedPage = (['dashboard', 'onboarding', 'command', 'chat'] as const).find(
+    page => pathname === `/${page}` || pathname.startsWith(`/${page}/`),
+  );
+  const isAuthRoute = pathname === '/login' || pathname === '/login/';
+  const tracing = authDiagnosticsEnabled() && (!!protectedPage || isAuthRoute);
+  const requestId = tracing ? crypto.randomUUID() : null;
+  const incomingSession = tracing ? authCookieState(request.cookies.getAll()).sessionCookieCount : 0;
+  // Do not accept a trace identifier supplied by the client.
+  if (requestId) request.headers.set(AUTH_REQUEST_ID, requestId);
   let response = NextResponse.next({
     request: { headers: request.headers },
   });
@@ -36,21 +47,21 @@ export async function middleware(request: NextRequest) {
   );
 
   const {
-    data: { user },
+    data: { user }, error,
   } = await supabase.auth.getUser();
 
-  const { pathname, search, searchParams } = request.nextUrl;
-  const isProtectedRoute = ['/dashboard', '/onboarding', '/command', '/chat'].some(
-    path => pathname === path || pathname.startsWith(`${path}/`),
-  );
-  const isAuthRoute = pathname === '/login' || pathname === '/login/';
   function redirectWithCookies(url: URL) {
     const result = NextResponse.redirect(url, { headers: { 'Cache-Control': 'no-store' } });
     for (const cookie of response.cookies.getAll()) result.cookies.set(cookie);
     return result;
   }
 
-  if (isProtectedRoute && !user) {
+  if (tracing) authDiagnostic('middleware', {
+    requestId, page: isAuthRoute ? 'login' : protectedPage!, userRecognized: !!user, sessionCookiesReceived: incomingSession,
+    reason: protectedPage && !user ? 'protected_route_requires_user' : isAuthRoute && user ? 'login_user_already_authenticated' : 'continue',
+    ...safeAuthError(error),
+  });
+  if (protectedPage && !user) {
     return redirectWithCookies(loginUrl(getAppOrigin(), `${pathname}${search}`));
   }
   if (isAuthRoute && user) {

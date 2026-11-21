@@ -1,3 +1,5 @@
+import { cookies, headers } from 'next/headers';
+import { AUTH_REQUEST_ID, authCookieState, authDiagnostic, authDiagnosticsEnabled, safeAuthError } from '@/lib/auth/diagnostics';
 import { redirect } from 'next/navigation';
 import { getAppOrigin } from '@/lib/auth/app-origin';
 import { loginUrl } from '@/lib/auth/redirect';
@@ -12,9 +14,17 @@ import SignOutButton from './sign-out-button';
 export default async function DashboardPage() {
   const supabase = await createSupabaseServerClient();
   const {
-    data: { user },
+    data: { user }, error,
   } = await supabase.auth.getUser();
 
+  let requestId: string | null = null;
+  const tracing = authDiagnosticsEnabled();
+  if (tracing) {
+    const incoming = (await headers()).get(AUTH_REQUEST_ID);
+    requestId = incoming && /^[a-f0-9-]{36}$/.test(incoming) ? incoming : null;
+    authDiagnostic('dashboard', { requestId, userRecognized: !!user, ...authCookieState((await cookies()).getAll()),
+      reason: user ? 'session_recognized' : 'dashboard_requires_user', ...safeAuthError(error) });
+  }
   if (!user) {
     redirect(loginUrl(getAppOrigin(), '/dashboard').href);
   }
@@ -26,6 +36,7 @@ export default async function DashboardPage() {
     .where(eq(workspaceMembers.userId, user.id));
 
   if (memberships.length === 0) {
+    if (tracing) authDiagnostic('dashboard', { requestId, reason: 'authenticated_user_has_no_workspace' });
     redirect('/onboarding');
   }
 

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import Module from 'node:module';
 import { createClient } from '@supabase/supabase-js';
 import { NextRequest } from 'next/server';
+import { AUTH_REQUEST_ID } from '../src/lib/auth/diagnostics';
 import { getAppOrigin } from '../src/lib/auth/app-origin';
 import { signOutToLogin, startEmailLogin, startOAuthLogin } from '../src/lib/auth/browser-flow';
 import { authCallbackUrl, safeAuthPath } from '../src/lib/auth/redirect';
@@ -67,13 +68,17 @@ async function main() {
   let exchangeCount = 0;
   let otpCount = 0;
   let throwExchange = false;
+  const sensitive = 'never-log-this-fixture';
+  let verifierError = false;
   const mod = Module as unknown as { _load: (name: string, ...args: unknown[]) => unknown };
   const load = mod._load;
   mod._load = (name, ...args) => {
-    if (name === '@/lib/auth/supabase-server') return { createSupabaseServerClient: async () => ({ auth: {
+    if (name === '@/lib/auth/supabase-server') return { createSupabaseServerClient: async (observe?: (result: { written: number; failed: boolean }) => void) => ({ auth: {
       async exchangeCodeForSession(code: string) {
         exchangeCount++;
+        if (verifierError) return { error: { name: 'AuthPKCECodeVerifierMissingError', code: sensitive, message: sensitive }, data: { session: null } };
         if (throwExchange) throw new Error('provider unavailable');
+        if (code !== 'no-session') observe?.({ written: 2, failed: false });
         return code === 'no-session' ? { error: null, data: { session: null } } : { error: null, data: { session: { user: 'fixture' } } };
       },
       async verifyOtp(payload: { token_hash: string; type: string }) {
@@ -131,6 +136,45 @@ async function main() {
     assert.equal((await middleware(request(`/login?${new URLSearchParams({ redirectTo: destination })}`))).headers.get('location'), `${render}${destination}`);
     assert.equal((await middleware(request(`/login?${new URLSearchParams({ redirectTo: oldHost })}`))).headers.get('location'), `${render}/dashboard`);
     ok('middleware preserves all protected routes, refreshed cookies, and signed-in return targets; Business password page remains available');
+
+    const events: Record<string, unknown>[] = [];
+    const info = console.info;
+    console.info = (json: string) => events.push(JSON.parse(json));
+    process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://supabase.example.test';
+    const cookies = `sb-supabase-auth-token-code-verifier=${sensitive}; sb-supabase-auth-token.0=${sensitive}; sb-supabase-auth-token.1=${sensitive}`;
+    const tracedRequest = (path: string) => new NextRequest(new URL(path, render), { headers: { cookie: cookies, [AUTH_REQUEST_ID]: sensitive } });
+    try {
+      throwExchange = false;
+      delete process.env.AUTH_DIAGNOSTICS;
+      await GET(tracedRequest(`/api/auth/callback?code=${sensitive}`));
+      assert.equal(events.length, 0);
+      process.env.AUTH_DIAGNOSTICS = 'true';
+      await GET(tracedRequest(`/api/auth/callback?code=${sensitive}`));
+      assert.equal(events[0]?.event, 'callback_arrival');
+      assert.equal(events[0]?.codePresent, true);
+      assert.equal(events[0]?.pkceCookiePresent, true);
+      assert.equal(events[0]?.sessionCookieCount, 2);
+      assert.equal(events[1]?.event, 'callback_result');
+      assert.equal(events[1]?.requestId, events[0]?.requestId);
+      assert.equal(events[1]?.reason, 'exchange_succeeded');
+      assert.equal(events[1]?.sessionCookiesWritten, 2);
+      verifierError = true;
+      await GET(tracedRequest(`/api/auth/callback?code=${sensitive}`));
+      assert.equal(events[3]?.reason, 'exchange_failed');
+      assert.equal(events[3]?.errorKind, 'pkce_verifier_missing');
+      assert.equal(events[3]?.errorCode, null);
+      assert.equal(events[3]?.sessionCookiesWritten, 0);
+      signedIn = false;
+      await middleware(tracedRequest(`/dashboard?workspace=${sensitive}`));
+      assert.equal(events[4]?.reason, 'protected_route_requires_user');
+      assert.equal(events[4]?.sessionCookiesReceived, 2);
+      assert.notEqual(events[4]?.requestId, sensitive);
+      assert.ok(!JSON.stringify(events).includes(sensitive));
+    } finally {
+      delete process.env.AUTH_DIAGNOSTICS;
+      console.info = info;
+    }
+    ok('opt-in diagnostics distinguish callback and middleware failures without logging raw input or SDK errors');
   } finally { mod._load = load; }
   console.log(`${passed} auth checks passed`);
 }
